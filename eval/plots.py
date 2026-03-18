@@ -90,3 +90,38 @@ def plot_prediction_timeseries(pred_table: pd.DataFrame, model_name: str, out_pa
     plt.savefig(out_path)
     plt.close()
 
+
+def plot_feature_importance(importances: list[dict], out_path: str, top_k: int) -> None:
+    """Plot a horizontal bar chart of top-K feature importances."""
+
+    # Convert importance rows into a sorted DataFrame.
+    table = pd.DataFrame(importances).copy()
+    table["importance"] = table["importance"].astype(float)
+    table = table.sort_values("importance", ascending=False).head(int(top_k))
+
+    # Draw a compact barh chart to show relative magnitudes.
+    plt.figure(figsize=(8, 6))
+    plt.barh(table["feature"][::-1], table["importance"][::-1])
+    plt.title(f"XGB Feature Importance (Top {int(top_k)})")
+    plt.xlabel("importance")
+    plt.tight_layout()
+    plt.savefig(out_path)
+    plt.close()
+
+
+def plot_cumulative_metric(daily: pd.DataFrame, value_col: str, title: str, out_path: str) -> None:
+    """Plot cumulative sum of a daily metric series."""
+
+    # Build x-axis as datetime and compute the cumulative series.
+    dates = pd.to_datetime(daily["date"].astype(str), format="%Y%m%d")
+    values = daily[value_col].astype(float).fillna(0.0).to_numpy()
+    cumulative = np.cumsum(values)
+
+    # Create and save a compact cumulative curve chart.
+    plt.figure(figsize=(12, 4))
+    plt.plot(dates, cumulative, label=f"cumsum({value_col})", linewidth=1.2)
+    plt.title(title)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(out_path)
+    plt.close()

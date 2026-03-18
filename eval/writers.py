@@ -160,6 +160,10 @@ def write_data_audit_md(
         f"| last | {coverage_audit['last_minute']['weight_coverage_mean']:.6f} | {coverage_audit['last_minute']['missing_rate_mean']:.6f} | {coverage_audit['last_minute']['join_retention_mean']:.6f} | {coverage_audit['last_minute']['n']} |"
     )
     lines.append("")
+    lines.append("## Appendix")
+    lines.append("")
+    lines.append("- 为了保持主报告聚焦结论, 分钟级长表移至附录。")
+    lines.append("")
     lines.append("### 分钟级覆盖率表 (Per-Minute Table)")
     lines.append("")
     lines.append("| minute_index | weight_coverage | missing_rate | breadth_pos | join_retention | n |")
@@ -192,16 +196,72 @@ def write_data_audit_md(
 def write_report_md(report_dir: str, run_id: str, metrics: dict) -> None:
     """Write a main report markdown with key results and methodology."""
 
-    # Compose a lightweight report with links to artifacts.
+    # Convert YYYYMMDD integers into ISO dates for report readability.
+    def _date_int_to_iso(date_int: int) -> str:
+        """Convert an int YYYYMMDD into an ISO date string."""
+
+        # Split into year, month, and day for stable formatting.
+        year = int(date_int) // 10000
+        month = (int(date_int) // 100) % 100
+        day = int(date_int) % 100
+        return f"{year:04d}-{month:02d}-{day:02d}"
+
+    # Summarize walk-forward stability as compact statistics.
+    def _summarize_walk_forward(wf_rows: list[dict]) -> dict:
+        """Summarize walk-forward fold metrics into simple stats."""
+
+        # Collect fold metrics into numeric arrays.
+        ic_vals = np.array([float(row["ic"]) for row in wf_rows], dtype=float)
+        rank_ic_vals = np.array([float(row["rank_ic"]) for row in wf_rows], dtype=float)
+
+        # Compute negative-rate and quantiles for stability diagnostics.
+        return {
+            "folds": int(len(wf_rows)),
+            "neg_ic_folds": int(np.sum(ic_vals < 0.0)),
+            "neg_rank_ic_folds": int(np.sum(rank_ic_vals < 0.0)),
+            "ic_min": float(np.nanmin(ic_vals)),
+            "ic_median": float(np.nanmedian(ic_vals)),
+            "ic_max": float(np.nanmax(ic_vals)),
+            "rank_ic_min": float(np.nanmin(rank_ic_vals)),
+            "rank_ic_median": float(np.nanmedian(rank_ic_vals)),
+            "rank_ic_max": float(np.nanmax(rank_ic_vals)),
+        }
+
+    # Compose a conclusion-driven report with embedded artifacts.
     lines: list[str] = []
     lines.append(f"# 报告 (Report, {run_id})")
+    lines.append("")
+    # Add explicit test coverage range at the top.
+    xgb_daily = metrics["daily"]["xgb"]
+    test_start = int(min([int(row["date"]) for row in xgb_daily]))
+    test_end = int(max([int(row["date"]) for row in xgb_daily]))
+    lines.append("## 测试区间 (Test Coverage)")
+    lines.append("")
+    lines.append(f"- Test coverage: `{_date_int_to_iso(test_start)}` 至 `{_date_int_to_iso(test_end)}`.")
+    lines.append("")
+    lines.append("## Takeaways")
+    lines.append("")
+    # Highlight ranking vs point-error trade-off across models.
+    xgb_test = metrics["overall"]["xgb"]["test"]
+    linear_test = metrics["overall"]["linear_model"]["test"]
+    zero_test = metrics["overall"]["zero"]["test"]
+    lines.append(
+        f"- **排序能力 (IC/Rank IC)**: `xgb` 在 test 上 IC={float(xgb_test['ic']):.4f}, RankIC={float(xgb_test['rank_ic']):.4f}, 明显领先, 更适合作为选股/排序信号的候选。"
+    )
+    lines.append(
+        f"- **点预测误差 (RMSE/MAE)**: `linear_model` 的 RMSE={float(linear_test['rmse']):.6f}, MAE={float(linear_test['mae']):.6f} 更低, 更偏向“数值预测”口径的优势。"
+    )
+    lines.append(
+        f"- **方向准确率 (Direction Acc)**: `zero` 的 DirAcc={float(zero_test['direction_acc']):.4f} 并不差, 说明在高噪声短周期里, 方向类指标可能被基准/样本分布主导, 不能替代 IC/误差口径。"
+    )
+    lines.append("- 结论上, 本任务应同时观察“排序能力”和“点预测误差”, 避免只用单一指标做模型选择。")
     lines.append("")
     lines.append("## Pipeline")
     lines.append("")
     lines.append("- Data: `/data/ashare/market/etf1m` and `/data/ashare/market/stock1m`.")
     lines.append("- Index weights: `data/ashare/market/index_weight/000905.feather` (symlinked).")
     lines.append("- Label horizon: 10 minutes.")
-    lines.append("- Split: train `20210101-20231231`, test `>=20240201`.")
+    lines.append(f"- Split: train `20210101-20231231`, test `{_date_int_to_iso(test_start)}` 至 `{_date_int_to_iso(test_end)}`.")
     lines.append("")
     lines.append("## 模型 (Models)")
     lines.append("")
@@ -210,17 +270,29 @@ def write_report_md(report_dir: str, run_id: str, metrics: dict) -> None:
     lines.append("")
     lines.append("## 测试集指标 (Test, Overall)")
     lines.append("")
+    # Present overall metrics as a compact table for cross-model comparison.
+    lines.append("| model | ic | rank_ic | dir_acc | rmse | mae | n |")
+    lines.append("| --- | --- | --- | --- | --- | --- | --- |")
     for model_name in sorted(metrics["overall"].keys()):
-        row = metrics["overall"][model_name].get("test", {})
-        if len(row) == 0:
-            continue
+        row = metrics["overall"][model_name]["test"]
         lines.append(
-            f"- {model_name}: IC={row['ic']:.4f}, RankIC={row['rank_ic']:.4f}, "
-            f"DirAcc={row['direction_acc']:.4f}, RMSE={row['rmse']:.6f}, MAE={row['mae']:.6f}, n={row['n']}"
+            f"| {model_name} | {float(row['ic']):.6f} | {float(row['rank_ic']):.6f} | {float(row['direction_acc']):.6f} | {float(row['rmse']):.6f} | {float(row['mae']):.6f} | {int(row['n'])} |"
         )
     lines.append("")
     if "walk_forward" in metrics and "xgb" in metrics["walk_forward"]:
-        lines.append("## Walk-forward 验证 (Train)")
+        lines.append("## Walk-forward 稳定性 (Train, Expanding Window)")
+        lines.append("")
+        # Provide a stability summary before the fold table.
+        wf_stats = _summarize_walk_forward(metrics["walk_forward"]["xgb"])
+        lines.append(
+            f"- folds: `{wf_stats['folds']}`, neg_ic_folds: `{wf_stats['neg_ic_folds']}`, neg_rank_ic_folds: `{wf_stats['neg_rank_ic_folds']}`."
+        )
+        lines.append(
+            f"- ic (min/median/max): `{wf_stats['ic_min']:.4f}` / `{wf_stats['ic_median']:.4f}` / `{wf_stats['ic_max']:.4f}`."
+        )
+        lines.append(
+            f"- rank_ic (min/median/max): `{wf_stats['rank_ic_min']:.4f}` / `{wf_stats['rank_ic_median']:.4f}` / `{wf_stats['rank_ic_max']:.4f}`."
+        )
         lines.append("")
         wf = metrics["walk_forward"]["xgb"]
         lines.append("| val_month | train_month_start | train_month_end | ic | rank_ic | n |")
@@ -230,8 +302,38 @@ def write_report_md(report_dir: str, run_id: str, metrics: dict) -> None:
                 f"| {int(row['val_month'])} | {int(row['train_month_start'])} | {int(row['train_month_end'])} | {float(row['ic']):.6f} | {float(row['rank_ic']):.6f} | {int(row['n'])} |"
             )
         lines.append("")
+    if "by_month" in metrics and "xgb" in metrics["by_month"]:
+        lines.append("## 月度稳定性诊断 (Monthly, Test)")
+        lines.append("")
+        # Use by_month metrics to surface drawdown risk and regime breaks.
+        by_month = metrics["by_month"]["xgb"]
+        month_lookup = {int(row["month"]): row for row in by_month}
+        for month in [202410, 202601]:
+            row = month_lookup[month]
+            lines.append(
+                f"- 风险提示: `xgb` 在 `{month}` 出现负 IC, IC={float(row['ic']):.4f}, RankIC={float(row['rank_ic']):.4f}, DirAcc={float(row['direction_acc']):.4f}, 这类月份在实盘排序信号上可能对应明显回撤。"
+            )
+        lines.append("")
+        lines.append("| month | ic | rank_ic | dir_acc | rmse | mae | n |")
+        lines.append("| --- | --- | --- | --- | --- | --- | --- |")
+        for row in by_month:
+            lines.append(
+                f"| {int(row['month'])} | {float(row['ic']):.6f} | {float(row['rank_ic']):.6f} | {float(row['direction_acc']):.6f} | {float(row['rmse']):.6f} | {float(row['mae']):.6f} | {int(row['n'])} |"
+            )
+        lines.append("")
     if "feature_ic" in metrics and "test" in metrics["feature_ic"]:
-        lines.append("## 新特征有效性 (Feature IC/IR, Test)")
+        lines.append("## 特征分析 (Feature IC vs. Model Importance)")
+        lines.append("")
+        # Explain why single-feature IC and model importance can disagree.
+        lines.append(
+            "- 单特征 IC 衡量的是“线性单调相关”, 而树模型的重要性衡量的是“被用于分裂带来的损失下降”, 两者口径不同, 出现冲突是常见现象。"
+        )
+        lines.append(
+            "- `minute_index` 与 `etf_minus_comp_ret_1m` 在 test 上单特征 IC 为负, 但在 `xgb` 中重要性不低, 更可能表示它们在非线性/分段条件下提供了有效信息, 或用于识别不同状态并调节其他特征的边际作用。"
+        )
+        lines.append(
+            "- 建议的验证路径: (1) 按分钟段或波动率分桶分别算 IC; (2) 做 permutation importance 或 SHAP 检查是否存在稳定贡献; (3) 检查这些特征在 202410/202601 是否发生分布漂移。"
+        )
         lines.append("")
         lines.append("| feature | ic | ir | daily_ic_mean | daily_ic_std | n_days |")
         lines.append("| --- | --- | --- | --- | --- | --- |")
@@ -243,19 +345,44 @@ def write_report_md(report_dir: str, run_id: str, metrics: dict) -> None:
     if "xgb_feature_importance" in metrics:
         lines.append("## XGB 特征重要性 (Feature Importance)")
         lines.append("")
+        # Mark features with zero importance as candidates for removal.
+        zero_imp = [row["feature"] for row in metrics["xgb_feature_importance"] if float(row["importance"]) == 0.0]
+        lines.append(
+            "- Importance 为 0 的特征可视为“待剔除/逻辑失效”的候选: " + ", ".join([f"`{name}`" for name in zero_imp]) + "."
+        )
+        lines.append("")
         lines.append("| feature | importance |")
         lines.append("| --- | --- |")
         for row in metrics["xgb_feature_importance"][:30]:
             lines.append(f"| {row['feature']} | {float(row['importance']):.6f} |")
         lines.append("")
+    lines.append("## 数据审计摘要 (Data Audit Highlights)")
+    lines.append("")
+    # Pull the minimal audit numbers into the main report to avoid long tables.
+    audit = metrics["data_audit_summary"]
+    lines.append(f"- Overall retention (join_retention_mean): `{float(audit['overall_join_retention_mean']):.6f}`.")
+    lines.append(
+        f"- First minute: weight_coverage_mean=`{float(audit['first_minute_weight_coverage_mean']):.6f}`, "
+        f"missing_rate_mean=`{float(audit['first_minute_missing_rate_mean']):.6f}`, "
+        f"join_retention_mean=`{float(audit['first_minute_join_retention_mean']):.6f}`."
+    )
+    lines.append(
+        f"- Last minute: weight_coverage_mean=`{float(audit['last_minute_weight_coverage_mean']):.6f}`, "
+        f"missing_rate_mean=`{float(audit['last_minute_missing_rate_mean']):.6f}`, "
+        f"join_retention_mean=`{float(audit['last_minute_join_retention_mean']):.6f}`."
+    )
+    lines.append("")
     lines.append("## 图表 (Figures)")
     lines.append("")
-    lines.append("- `fig_ic_timeseries.png`")
-    lines.append("- `fig_rank_ic_timeseries.png`")
-    lines.append("- `fig_direction_acc_timeseries.png`")
-    lines.append("- `fig_baseline_comparison.png`")
-    lines.append("- `fig_prediction_scatter.png`")
-    lines.append("- `fig_prediction_timeseries.png`")
+    # Embed key figures with one-sentence business captions.
+    lines.append("![Cumulative IC (test)](fig_ic_cum.png)")
+    lines.append("*Caption: IC 累计曲线更接近信号随时间累积贡献, 用于观察长期漂移与回撤段。*")
+    lines.append("")
+    lines.append("![Baseline comparison (test)](fig_baseline_comparison.png)")
+    lines.append("*Caption: IC 与 RMSE 的并列对比强调“排序能力”和“点预测误差”往往不一致, 需要联合决策。*")
+    lines.append("")
+    lines.append("![XGB feature importance](fig_xgb_feature_importance.png)")
+    lines.append("*Caption: Top 特征重要性分布用于识别模型依赖的关键信息源, 并筛出可剔除的低贡献特征。*")
     lines.append("")
 
     # Write to file.
@@ -264,8 +391,39 @@ def write_report_md(report_dir: str, run_id: str, metrics: dict) -> None:
         f.write("\n".join(lines))
 
 
-def write_report_tex(report_dir: str, run_id: str, metrics: dict, out_name: str) -> None:
+def write_report_tex(report_dir: str, run_id: str, metrics: dict, out_name: str, asset_prefix: str) -> None:
     """Write a LaTeX research report with key results."""
+
+    # Escape common LaTeX special characters for safe table rendering.
+    def _tex_escape(text: str) -> str:
+        """Escape a plain string for LaTeX text context."""
+
+        # Apply minimal escaping for identifiers and file-like strings.
+        return (
+            str(text)
+            .replace("\\", "\\textbackslash{}")
+            .replace("&", "\\&")
+            .replace("_", "\\_")
+            .replace("%", "\\%")
+            .replace("#", "\\#")
+        )
+
+    # Wrap filesystem paths so LaTeX accepts underscores in filenames.
+    def _tex_path(path: str) -> str:
+        """Wrap a path with \\detokenize{} for \\includegraphics."""
+
+        # Use detokenize to avoid escaping every filename character.
+        return "\\detokenize{" + path + "}"
+
+    # Convert YYYYMMDD integers into ISO dates for report readability.
+    def _date_int_to_iso(date_int: int) -> str:
+        """Convert an int YYYYMMDD into an ISO date string."""
+
+        # Split into year, month, and day for stable formatting.
+        year = int(date_int) // 10000
+        month = (int(date_int) // 100) % 100
+        day = int(date_int) % 100
+        return f"{year:04d}-{month:02d}-{day:02d}"
 
     # Collect overall test metrics for a compact table.
     overall = metrics.get("overall", {})
@@ -277,12 +435,18 @@ def write_report_tex(report_dir: str, run_id: str, metrics: dict, out_name: str)
             continue
         test_rows.append((model_name, row))
 
-    # Build a minimal LaTeX document that is easy to compile and review.
+    # Prepare test coverage range for the report header.
+    xgb_daily = metrics["daily"]["xgb"]
+    test_start = int(min([int(row["date"]) for row in xgb_daily]))
+    test_end = int(max([int(row["date"]) for row in xgb_daily]))
+
+    # Build a research-style LaTeX document aligned with the markdown depth.
     lines: list[str] = []
     lines.append("\\documentclass[11pt]{article}")
     lines.append("\\usepackage[margin=1in]{geometry}")
     lines.append("\\usepackage{booktabs}")
     lines.append("\\usepackage{longtable}")
+    lines.append("\\usepackage{graphicx}")
     lines.append("\\usepackage{hyperref}")
     lines.append("\\title{510500 未来 10 分钟收益率预测研究报告}")
     lines.append(f"\\author{{Run: {run_id}}}")
@@ -298,7 +462,23 @@ def write_report_tex(report_dir: str, run_id: str, metrics: dict, out_name: str)
     lines.append("\\item ETF 1m: /data/ashare/market/etf1m")
     lines.append("\\item Stock 1m: /data/ashare/market/stock1m")
     lines.append("\\item Index weight: data/ashare/market/index\\_weight/000905.feather")
-    lines.append("\\item Train: 20210101--20231231, Test: from 20240201")
+    lines.append(f"\\item Train: 20210101--20231231, Test: {_date_int_to_iso(test_start)}--{_date_int_to_iso(test_end)}")
+    lines.append("\\end{itemize}")
+    lines.append("")
+    lines.append("\\section{Takeaways}")
+    lines.append("\\begin{itemize}")
+    xgb_test = metrics["overall"]["xgb"]["test"]
+    linear_test = metrics["overall"]["linear_model"]["test"]
+    zero_test = metrics["overall"]["zero"]["test"]
+    lines.append(
+        f"\\item 排序能力 (IC/Rank IC): xgb 在 test 上 IC={float(xgb_test['ic']):.4f}, RankIC={float(xgb_test['rank_ic']):.4f}, 更适合作为排序信号候选。"
+    )
+    lines.append(
+        f"\\item 点预测误差 (RMSE/MAE): linear\\_model 的 RMSE={float(linear_test['rmse']):.6f}, MAE={float(linear_test['mae']):.6f} 更低, 更偏向数值预测优势。"
+    )
+    lines.append(
+        f"\\item 方向准确率 (Direction Acc): zero 的 DirAcc={float(zero_test['direction_acc']):.4f}, 说明方向类指标可能被样本分布影响, 不能替代 IC/误差口径。"
+    )
     lines.append("\\end{itemize}")
     lines.append("")
     lines.append("\\section{标签定义}")
@@ -323,6 +503,99 @@ def write_report_tex(report_dir: str, run_id: str, metrics: dict, out_name: str)
         )
     lines.append("\\bottomrule")
     lines.append("\\end{longtable}")
+    lines.append("")
+    lines.append("\\section{月度稳定性诊断 (Test)}")
+    lines.append("特别关注出现负 IC 的月份, 其对应排序信号可能带来显著回撤风险。")
+    lines.append("\\begin{longtable}{rrrrrrr}")
+    lines.append("\\toprule")
+    lines.append("Month & IC & RankIC & DirAcc & RMSE & MAE & N\\\\")
+    lines.append("\\midrule")
+    for row in metrics["by_month"]["xgb"]:
+        lines.append(
+            f"{int(row['month'])} & {float(row['ic']):.4f} & {float(row['rank_ic']):.4f} & {float(row['direction_acc']):.4f} & {float(row['rmse']):.6f} & {float(row['mae']):.6f} & {int(row['n'])}\\\\"
+        )
+    lines.append("\\bottomrule")
+    lines.append("\\end{longtable}")
+    lines.append("")
+    lines.append("\\section{Walk-forward 稳定性 (Train)}")
+    wf_rows = metrics["walk_forward"]["xgb"]
+    folds = int(len(wf_rows))
+    neg_ic_folds = int(sum([float(r["ic"]) < 0.0 for r in wf_rows]))
+    neg_rank_ic_folds = int(sum([float(r["rank_ic"]) < 0.0 for r in wf_rows]))
+    lines.append(f"Fold 数={folds}, 其中 IC<0 的 fold 数={neg_ic_folds}, RankIC<0 的 fold 数={neg_rank_ic_folds}。")
+    lines.append("\\begin{longtable}{rrrrrr}")
+    lines.append("\\toprule")
+    lines.append("ValMonth & TrainStart & TrainEnd & IC & RankIC & N\\\\")
+    lines.append("\\midrule")
+    for row in wf_rows:
+        lines.append(
+            f"{int(row['val_month'])} & {int(row['train_month_start'])} & {int(row['train_month_end'])} & {float(row['ic']):.4f} & {float(row['rank_ic']):.4f} & {int(row['n'])}\\\\"
+        )
+    lines.append("\\bottomrule")
+    lines.append("\\end{longtable}")
+    lines.append("")
+    lines.append("\\section{特征分析}")
+    lines.append("单特征 IC 与模型重要性存在口径差异: 前者度量线性相关, 后者度量分裂贡献。")
+    lines.append("\\subsection{Feature IC/IR (Test)}")
+    lines.append("\\begin{longtable}{lrrrrr}")
+    lines.append("\\toprule")
+    lines.append("Feature & IC & IR & DailyICMean & DailyICStd & NDays\\\\")
+    lines.append("\\midrule")
+    for row in metrics["feature_ic"]["test"]:
+        lines.append(
+            f"{_tex_escape(row['feature'])} & {float(row['ic']):.4f} & {float(row['ir']):.4f} & {float(row['daily_ic_mean']):.4f} & {float(row['daily_ic_std']):.4f} & {int(row['n_days'])}\\\\"
+        )
+    lines.append("\\bottomrule")
+    lines.append("\\end{longtable}")
+    lines.append("")
+    lines.append("\\subsection{XGB Feature Importance}")
+    zero_imp = [row["feature"] for row in metrics["xgb_feature_importance"] if float(row["importance"]) == 0.0]
+    lines.append("Importance 为 0 的特征建议优先剔除并复验: " + ", ".join([_tex_escape(name) for name in zero_imp]) + ".")
+    lines.append("\\begin{longtable}{lr}")
+    lines.append("\\toprule")
+    lines.append("Feature & Importance\\\\")
+    lines.append("\\midrule")
+    for row in metrics["xgb_feature_importance"][:30]:
+        lines.append(f"{_tex_escape(row['feature'])} & {float(row['importance']):.6f}\\\\")
+    lines.append("\\bottomrule")
+    lines.append("\\end{longtable}")
+    lines.append("")
+    lines.append("\\section{数据审计摘要}")
+    audit = metrics["data_audit_summary"]
+    lines.append("\\begin{itemize}")
+    lines.append(f"\\item Overall retention (join\\_retention\\_mean): {float(audit['overall_join_retention_mean']):.6f}.")
+    lines.append(
+        f"\\item First minute: weight\\_coverage\\_mean={float(audit['first_minute_weight_coverage_mean']):.6f}, missing\\_rate\\_mean={float(audit['first_minute_missing_rate_mean']):.6f}, join\\_retention\\_mean={float(audit['first_minute_join_retention_mean']):.6f}."
+    )
+    lines.append(
+        f"\\item Last minute: weight\\_coverage\\_mean={float(audit['last_minute_weight_coverage_mean']):.6f}, missing\\_rate\\_mean={float(audit['last_minute_missing_rate_mean']):.6f}, join\\_retention\\_mean={float(audit['last_minute_join_retention_mean']):.6f}."
+    )
+    lines.append("\\end{itemize}")
+    lines.append("")
+    lines.append("\\section{关键图表}")
+    # Include key figures; asset_prefix controls whether paths live under run_id/.
+    def _fig(name: str) -> str:
+        # Build a relative path to the artifact for LaTeX compilation.
+        rel = os.path.join(asset_prefix, name) if len(asset_prefix) else name
+        return _tex_path(rel)
+
+    lines.append("\\begin{figure}[ht]")
+    lines.append("\\centering")
+    lines.append("\\includegraphics[width=\\linewidth]{" + _fig("fig_ic_cum.png") + "}")
+    lines.append("\\caption{IC 累计曲线更接近信号随时间累积贡献, 用于观察长期漂移与回撤段.}")
+    lines.append("\\end{figure}")
+    lines.append("")
+    lines.append("\\begin{figure}[ht]")
+    lines.append("\\centering")
+    lines.append("\\includegraphics[width=\\linewidth]{" + _fig("fig_baseline_comparison.png") + "}")
+    lines.append("\\caption{IC 与 RMSE 的并列对比强调排序能力和点预测误差往往不一致, 需要联合决策.}")
+    lines.append("\\end{figure}")
+    lines.append("")
+    lines.append("\\begin{figure}[ht]")
+    lines.append("\\centering")
+    lines.append("\\includegraphics[width=0.9\\linewidth]{" + _fig("fig_xgb_feature_importance.png") + "}")
+    lines.append("\\caption{Top 特征重要性分布用于识别模型依赖的信息源, 并筛出可剔除的低贡献特征.}")
+    lines.append("\\end{figure}")
     lines.append("")
     lines.append("\\section{产出物}")
     lines.append("本次运行的关键产出包括: metrics.yaml, predictions.parquet, data\\_audit.md, summary.md, report.md, 以及各类图表 (IC/RankIC/DirectionAcc 时序, baseline 对比, scatter, timeseries)。")

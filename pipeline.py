@@ -16,7 +16,9 @@ from models.baselines import compute_baseline_preds, fit_linear_baseline
 from models.xgb import fit_xgb_model
 from eval.plots import (
     plot_baseline_comparison,
+    plot_cumulative_metric,
     plot_daily_timeseries,
+    plot_feature_importance,
     plot_prediction_scatter,
     plot_prediction_timeseries,
 )
@@ -460,7 +462,7 @@ def main() -> None:
     predictions_path = os.path.join(report_dir, "predictions.parquet")
     predictions.to_parquet(predictions_path, index=False)
 
-    # Compute metrics and write metrics.yaml.
+    # Compute metrics and prepare metrics.yaml payload.
     metrics = compute_metrics(pred_table=predictions)
     metrics["walk_forward"] = {"xgb": walk_forward_rows}
     new_features = [
@@ -482,6 +484,20 @@ def main() -> None:
             reverse=True,
         )
     ]
+
+    # Compute coverage audit once and persist the summary into metrics for the main report.
+    coverage_audit = compute_coverage_audit_tables(dataset=dataset)
+    metrics["data_audit_summary"] = {
+        "overall_join_retention_mean": float(coverage_audit["overall"]["join_retention_mean"]),
+        "first_minute_weight_coverage_mean": float(coverage_audit["first_minute"]["weight_coverage_mean"]),
+        "first_minute_missing_rate_mean": float(coverage_audit["first_minute"]["missing_rate_mean"]),
+        "first_minute_join_retention_mean": float(coverage_audit["first_minute"]["join_retention_mean"]),
+        "last_minute_weight_coverage_mean": float(coverage_audit["last_minute"]["weight_coverage_mean"]),
+        "last_minute_missing_rate_mean": float(coverage_audit["last_minute"]["missing_rate_mean"]),
+        "last_minute_join_retention_mean": float(coverage_audit["last_minute"]["join_retention_mean"]),
+    }
+
+    # Write metrics.yaml after all report-relevant summaries are attached.
     write_yaml(os.path.join(report_dir, "metrics.yaml"), metrics)
 
     # Write data audit and spot checks.
@@ -500,7 +516,6 @@ def main() -> None:
                 horizon_minutes=label_horizon_minutes,
             )
         )
-    coverage_audit = compute_coverage_audit_tables(dataset=dataset)
     write_data_audit_md(
         report_dir=report_dir,
         spot_checks=spot_checks,
@@ -511,8 +526,20 @@ def main() -> None:
     # Write summary and report markdown.
     write_summary_md(report_dir=report_dir, run_id=run_id, metrics=metrics, feature_cols=feature_cols)
     write_report_md(report_dir=report_dir, run_id=run_id, metrics=metrics)
-    write_report_tex(report_dir=os.path.join(repo_root, "report"), run_id=run_id, metrics=metrics, out_name="report0318.tex")
-    write_report_tex(report_dir=report_dir, run_id=run_id, metrics=metrics, out_name="report0318.tex")
+    write_report_tex(
+        report_dir=os.path.join(repo_root, "report"),
+        run_id=run_id,
+        metrics=metrics,
+        out_name="report0318.tex",
+        asset_prefix=run_id,
+    )
+    write_report_tex(
+        report_dir=report_dir,
+        run_id=run_id,
+        metrics=metrics,
+        out_name="report0318.tex",
+        asset_prefix="",
+    )
 
     # Create figures based on the main model daily series.
     daily_merged = pd.DataFrame(metrics["rolling"]["xgb"])
@@ -523,6 +550,12 @@ def main() -> None:
         roll_60_col="ic_roll_60",
         title="Daily IC (test)",
         out_path=os.path.join(report_dir, "fig_ic_timeseries.png"),
+    )
+    plot_cumulative_metric(
+        daily=daily_merged,
+        value_col="ic",
+        title="Cumulative IC (test)",
+        out_path=os.path.join(report_dir, "fig_ic_cum.png"),
     )
     plot_daily_timeseries(
         daily=daily_merged,
@@ -541,6 +574,11 @@ def main() -> None:
         out_path=os.path.join(report_dir, "fig_direction_acc_timeseries.png"),
     )
     plot_baseline_comparison(metrics=metrics, split="test", out_path=os.path.join(report_dir, "fig_baseline_comparison.png"))
+    plot_feature_importance(
+        importances=metrics["xgb_feature_importance"],
+        out_path=os.path.join(report_dir, "fig_xgb_feature_importance.png"),
+        top_k=20,
+    )
     plot_prediction_scatter(pred_table=predictions, model_name="xgb", out_path=os.path.join(report_dir, "fig_prediction_scatter.png"))
     plot_prediction_timeseries(
         pred_table=predictions, model_name="xgb", out_path=os.path.join(report_dir, "fig_prediction_timeseries.png")
