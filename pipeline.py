@@ -9,26 +9,40 @@ import pandas as pd
 
 from eval.metrics import compute_metrics
 from eval.feature_importance import compute_feature_ic_table
+from eval.stock_level import (
+    compute_panel_ic_by_minute,
+    summarize_panel_ic_by_minute_bucket,
+    summarize_panel_ic_daily,
+)
 from eval.walk_forward import run_walk_forward_validation
-from features.components import compute_component_features
 from features.etf import compute_etf_features, compute_label_from_close
 from models.baselines import compute_baseline_preds, fit_linear_baseline
+from models.basis import fit_basis_linear_model
 from models.xgb import fit_xgb_model
 from eval.plots import (
     plot_baseline_comparison,
     plot_cumulative_metric,
     plot_daily_timeseries,
     plot_feature_importance,
+    plot_monthly_timeseries,
     plot_prediction_scatter,
     plot_prediction_timeseries,
+    plot_raw_vs_basis_delta,
 )
 from eval.writers import (
     compute_coverage_audit_tables,
     write_data_audit_md,
+    write_bottom_up_report_md,
     write_report_md,
     write_report_tex,
     write_summary_md,
     write_yaml,
+)
+from basket_aggregator import aggregate_day_to_basket
+from stock_panel_loader import (
+    load_index_weights,
+    load_or_build_stock_panel_day,
+    write_stock_panel_parquet,
 )
 
 
@@ -79,35 +93,6 @@ def filter_dates_by_range(all_dates: list[int], start_date: int, end_date: int) 
     return kept_dates
 
 
-def load_index_weights(weight_path: str) -> pd.DataFrame:
-    """Load and preprocess index weights for 000905."""
-
-    # Load weights from feather.
-    weights = pd.read_feather(weight_path)
-
-    # Normalize columns for later joins and lookups.
-    weights = weights.loc[:, ["con_code", "trade_date", "weight"]].copy()
-    weights["trade_date"] = weights["trade_date"].astype(int)
-    weights["con_int"] = weights["con_code"].str.slice(0, 6).astype(int)
-    weights["weight_frac"] = weights["weight"].astype(float) / 100.0
-
-    # Sort for fast latest-trade-date lookup.
-    weights = weights.sort_values(["trade_date", "con_int"], ascending=[True, True])
-    return weights
-
-
-def get_constituent_weights_for_date(weights: pd.DataFrame, date: int) -> pd.DataFrame:
-    """Get the latest constituent weights as-of a given date."""
-
-    # Select the latest available trade_date not after the date.
-    trade_dates = np.sort(weights["trade_date"].unique())
-    chosen_trade_date = trade_dates[trade_dates <= date].max()
-
-    # Slice weights for the chosen trade_date.
-    day_weights = weights.loc[weights["trade_date"] == chosen_trade_date, ["con_int", "weight_frac"]].copy()
-    return day_weights
-
-
 def load_etf_minute_bars(etf1m_root: str, date: int, etf_code_int: int) -> pd.DataFrame:
     """Load one-day ETF 1m bars for a specific ETF."""
 
@@ -117,64 +102,9 @@ def load_etf_minute_bars(etf1m_root: str, date: int, etf_code_int: int) -> pd.Da
     day = pd.read_feather(file_path)
 
     # Filter to the target ETF and keep necessary columns.
-    day = day.loc[day["StockCode"] == etf_code_int, ["DateTime", "Close", "Vol", "Amount", "Date"]].copy()
+    day = day.loc[day["StockCode"] == etf_code_int, ["DateTime", "Close", "Vol", "Amount", "Date", "MinuteIndex"]].copy()
     day = day.sort_values("DateTime", ascending=True)
     return day
-
-
-def load_stock_minute_bars(stock1m_root: str, date: int, constituents: np.ndarray) -> pd.DataFrame:
-    """Load one-day stock 1m bars filtered by constituents."""
-
-    # Build the path and load the day file.
-    year = str(date)[:4]
-    file_path = os.path.join(stock1m_root, year, f"{date}.feather")
-    day = pd.read_feather(file_path)
-
-    # Filter to constituents and keep only required columns.
-    mask = day["StockCode"].isin(constituents)
-    day = day.loc[mask, ["StockCode", "DateTime", "Close", "Vol"]].copy()
-    day = day.sort_values(["StockCode", "DateTime"], ascending=[True, True])
-    return day
-
-
-def build_day_frame(
-    date: int,
-    weights: pd.DataFrame,
-    etf1m_root: str,
-    stock1m_root: str,
-    etf_code_int: int,
-    horizon_minutes: int,
-) -> pd.DataFrame:
-    """Build one-day modeling frame with features and label."""
-
-    # Load ETF bars and compute ETF features and label.
-    etf_day = load_etf_minute_bars(etf1m_root=etf1m_root, date=date, etf_code_int=etf_code_int)
-    etf_features = compute_etf_features(etf_day=etf_day)
-    label = compute_label_from_close(etf_day=etf_day, horizon_minutes=horizon_minutes)
-    label_frame = pd.DataFrame({"DateTime": etf_day["DateTime"], "label": label})
-
-    # Load weights as-of date and constituent stock bars for aggregation.
-    day_weights = get_constituent_weights_for_date(weights=weights, date=date)
-    constituents = day_weights["con_int"].to_numpy()
-    stock_day = load_stock_minute_bars(stock1m_root=stock1m_root, date=date, constituents=constituents)
-    comp_features = compute_component_features(stock_day=stock_day, day_weights=day_weights)
-
-    # Merge ETF features, component features, and label on DateTime.
-    frame = etf_features.merge(comp_features, on="DateTime", how="left")
-    frame = frame.merge(label_frame, on="DateTime", how="left")
-
-    # Add intraday time encoding features based on minute index within the day.
-    frame = frame.sort_values("DateTime", ascending=True).reset_index(drop=True)
-    minutes_in_day = int(len(frame))
-    minute_index = np.arange(minutes_in_day, dtype=int)
-    frame["minute_index"] = minute_index.astype(float)
-    minute_phase = 2.0 * np.pi * minute_index.astype(float) / float(minutes_in_day)
-    frame["minute_sin"] = np.sin(minute_phase)
-    frame["minute_cos"] = np.cos(minute_phase)
-
-    # Add ETF-constituent dispersion/breadth derived features.
-    frame["etf_minus_comp_ret_1m"] = frame["ret_1m"] - frame["comp_w_ret_1m"]
-    return frame
 
 
 def date_to_split(date: int) -> str:
@@ -188,118 +118,173 @@ def date_to_split(date: int) -> str:
     return "ignore"
 
 
-def load_or_build_day_frame(
-    date: int,
-    weights: pd.DataFrame,
-    cache_root: str,
-    etf1m_root: str,
-    stock1m_root: str,
-    etf_code_int: int,
-    horizon_minutes: int,
-) -> pd.DataFrame | None:
-    """Load cached day frame or build and cache it."""
+def choose_train_test_dates(
+    all_dates: list[int],
+    train_start: int,
+    train_end: int,
+    test_start: int,
+    max_train_days: int,
+    max_test_days: int,
+) -> tuple[list[int], list[int]]:
+    """Choose a bounded set of train/test dates to keep runs fast and reproducible."""
 
-    # Decide cache file path.
-    ensure_dir(cache_root)
-    cache_path = os.path.join(cache_root, f"{date}.parquet")
+    # Slice all available dates into calendar train/test buckets.
+    train_dates = [d for d in all_dates if int(train_start) <= int(d) <= int(train_end)]
+    test_dates = [d for d in all_dates if int(d) >= int(test_start)]
 
-    # Load from cache if available.
-    if os.path.exists(cache_path):
-        day = pd.read_parquet(cache_path)
-        # Normalize inf to NaN to keep downstream models stable.
-        day = day.replace([np.inf, -np.inf], np.nan)
-        return day
+    # Keep the most recent train days and the earliest test days.
+    train_kept = train_dates[-int(max_train_days) :]
+    test_kept = test_dates[: int(max_test_days)]
+    return train_kept, test_kept
 
-    # Build the day frame and cache it.
-    try:
-        day = build_day_frame(
-            date=date,
-            weights=weights,
-            etf1m_root=etf1m_root,
-            stock1m_root=stock1m_root,
-            etf_code_int=etf_code_int,
-            horizon_minutes=horizon_minutes,
+
+def pick_best_model_by_metric(etf_overall: dict, split: str, metric_name: str) -> str:
+    """Pick the best model name by a specific overall metric on a split."""
+
+    # Rank models by the metric and return the argmax.
+    scored: list[tuple[str, float]] = []
+    for model_name in sorted(etf_overall.keys()):
+        row = etf_overall[model_name].get(str(split), {})
+        scored.append((str(model_name), float(row.get(str(metric_name), float("nan")))))
+    scored_sorted = sorted(scored, key=lambda x: (np.nan_to_num(x[1], nan=-1e9)), reverse=True)
+    return str(scored_sorted[0][0])
+
+
+def compute_raw_vs_basis_delta_test(etf_overall: dict, pairs: list[tuple[str, str]]) -> list[dict]:
+    """Compute test IC/RankIC deltas between raw and basis-corrected models."""
+
+    # Build a small list of per-pair deltas for reporting.
+    rows: list[dict] = []
+    for raw_name, basis_name in pairs:
+        raw_row = etf_overall[str(raw_name)]["test"]
+        basis_row = etf_overall[str(basis_name)]["test"]
+        rows.append(
+            {
+                "raw_model": str(raw_name),
+                "basis_model": str(basis_name),
+                "ic_delta": float(basis_row["ic"]) - float(raw_row["ic"]),
+                "rank_ic_delta": float(basis_row["rank_ic"]) - float(raw_row["rank_ic"]),
+            }
         )
-    except Exception as exc:
-        print(f"[ERROR] Failed to build day frame for {date}: {exc}")
-        return None
-
-    # Persist to cache to speed up subsequent runs.
-    day = day.replace([np.inf, -np.inf], np.nan)
-    day.to_parquet(cache_path, index=False)
-    return day
+    return rows
 
 
-def build_full_dataset(
-    dates: list[int],
-    weights: pd.DataFrame,
-    cache_root: str,
-    etf1m_root: str,
-    stock1m_root: str,
-    etf_code_int: int,
-    horizon_minutes: int,
+def make_basket_prediction_table(
+    basket: pd.DataFrame,
+    model_name: str,
 ) -> pd.DataFrame:
-    """Build the full dataset over dates, using /data-cache for caching."""
+    """Build a standardized basket-level prediction table for metrics."""
 
-    # Iterate day-by-day to keep memory bounded and allow skipping failures.
-    frames: list[pd.DataFrame] = []
-    start_time = time.time()
-    for idx, date in enumerate(dates):
-        # Print periodic progress without spamming.
-        if idx % 50 == 0:
-            elapsed = time.time() - start_time
-            print(f"[INFO] Processing {idx}/{len(dates)} days. Elapsed={elapsed:.1f}s.")
+    # Standardize output columns required by compute_metrics.
+    out = pd.DataFrame(
+        {
+            "datetime": pd.to_datetime(basket["datetime"]).astype("datetime64[ns]"),
+            "date": basket["date"].astype(int),
+            "pred": basket["basket_pred"].astype(float),
+            "label": basket["basket_label"].astype(float),
+            "split": basket["split"].astype(str),
+            "model_name": model_name,
+        }
+    )
+    return out
 
-        # Load or build day frame and skip on errors.
-        day = load_or_build_day_frame(
-            date=date,
-            weights=weights,
-            cache_root=cache_root,
-            etf1m_root=etf1m_root,
-            stock1m_root=stock1m_root,
-            etf_code_int=etf_code_int,
-            horizon_minutes=horizon_minutes,
-        )
-        if day is None:
-            continue
 
-        # Attach split and date columns for later grouping and filtering.
-        split = date_to_split(date=date)
-        day = day.copy()
-        day["date"] = date
-        day["split"] = split
-        frames.append(day)
-
-    # Concatenate into a single frame.
-    full = pd.concat(frames, axis=0, ignore_index=True)
-
-    # Drop rows with unusable splits or label NaNs from horizon truncation.
-    full = full.loc[full["split"].isin(["train", "test"])].copy()
-    full = full.dropna(subset=["label"])
-
-    # Sort for correct baseline computations.
-    full = full.sort_values(["split", "DateTime"], ascending=[True, True]).reset_index(drop=True)
-    return full
-
-def make_prediction_table(
+def make_etf_prediction_table(
     frame: pd.DataFrame,
     model_name: str,
     pred: np.ndarray,
+    label_col: str,
 ) -> pd.DataFrame:
-    """Build a standardized prediction table for output."""
+    """Build a standardized ETF-level prediction table for metrics."""
 
-    # Standardize output columns required by AGENTS.md.
+    # Standardize output columns required by compute_metrics.
     out = pd.DataFrame(
         {
-            "datetime": pd.to_datetime(frame["DateTime"]).astype("datetime64[ns]"),
+            "datetime": pd.to_datetime(frame["datetime"]).astype("datetime64[ns]"),
             "date": frame["date"].astype(int),
             "pred": pred.astype(float),
-            "label": frame["label"].astype(float),
+            "label": frame[label_col].astype(float),
             "split": frame["split"].astype(str),
             "model_name": model_name,
         }
     )
     return out
+
+
+def collect_stock_training_sample(
+    dates: list[int],
+    weights: pd.DataFrame,
+    stock1m_root: str,
+    horizon_minutes: int,
+    cache_root: str,
+    feature_cols: list[str],
+    max_rows: int,
+    sample_mod: int,
+) -> pd.DataFrame:
+    """Collect a deterministic sample of stock panel rows for model training."""
+
+    # Iterate training dates and collect a stable subsample to control memory.
+    pieces: list[pd.DataFrame] = []
+    rows_collected = 0
+    for date in dates:
+        # Stop once enough rows are collected for training.
+        if int(rows_collected) >= int(max_rows):
+            break
+
+        # Load cached day panel and keep train split only.
+        day = load_or_build_stock_panel_day(
+            date=int(date),
+            weights=weights,
+            stock1m_root=stock1m_root,
+            horizon_minutes=horizon_minutes,
+            cache_root=cache_root,
+        )
+        day = day.loc[day["split"] == "train"].copy()
+        day = day.dropna(subset=["label_stock_10m"])
+
+        # Build a deterministic hash-based sample mask for reproducibility.
+        key = day["date"].astype(np.int64) * 1_000_000_000 + day["stock_code"].astype(np.int64) * 10_000 + day[
+            "MinuteIndex"
+        ].astype(np.int64)
+        mask = (key % int(sample_mod)).astype(int) == 0
+        sampled = day.loc[mask, ["date", "label_stock_10m"] + feature_cols].copy()
+        pieces.append(sampled)
+        rows_collected += int(len(sampled))
+
+    # Concatenate samples into a single training frame.
+    sample = pd.concat(pieces, axis=0, ignore_index=True)
+    return sample
+
+
+def build_etf_minute_dataset(
+    dates: list[int],
+    etf1m_root: str,
+    etf_code_int: int,
+    horizon_minutes: int,
+) -> pd.DataFrame:
+    """Build ETF minute feature/label dataset for basis modeling and evaluation."""
+
+    # Build per-day ETF frames to keep memory bounded.
+    frames: list[pd.DataFrame] = []
+    for date in dates:
+        # Load ETF bars and compute ETF features and label.
+        etf_day = load_etf_minute_bars(etf1m_root=etf1m_root, date=int(date), etf_code_int=etf_code_int)
+        etf_features = compute_etf_features(etf_day=etf_day)
+        label = compute_label_from_close(etf_day=etf_day, horizon_minutes=horizon_minutes)
+
+        # Assemble a day frame with stable columns for joins.
+        day = etf_features.copy()
+        day = day.rename(columns={"DateTime": "datetime", "Date": "date"})
+        day["MinuteIndex"] = etf_day["MinuteIndex"].astype(int).to_numpy()
+        day["label_etf_10m"] = label.astype(float).to_numpy()
+        day["split"] = date_to_split(date=int(date))
+        frames.append(day)
+
+    # Concatenate into one dataset and drop horizon-truncated labels.
+    full = pd.concat(frames, axis=0, ignore_index=True)
+    full = full.loc[full["split"].isin(["train", "test"])].copy()
+    full = full.dropna(subset=["label_etf_10m"])
+    return full
 
 
 def sample_spot_checks(
@@ -344,7 +329,7 @@ def sample_spot_checks(
 
 
 def main() -> None:
-    """Run end-to-end pipeline for 510500 10-minute return prediction."""
+    """Run the bottom-up synthesis pipeline for 510500."""
 
     # Define core constants from AGENTS.md.
     seed = 42
@@ -353,14 +338,15 @@ def main() -> None:
     train_start = 20210101
     train_end = 20231231
     test_start = 20240201
+    max_train_days = 260
+    max_test_days = 80
 
     # Define data locations.
     repo_root = os.path.dirname(os.path.abspath(__file__))
     weight_path = os.path.join(repo_root, "data/ashare/market/index_weight/000905.feather")
     etf1m_root = "/data/ashare/market/etf1m"
     stock1m_root = "/data/ashare/market/stock1m"
-    cache_root = "/data-cache/index500-predict/510500_10m_frame_v3"
-
+    stock_panel_cache_root = "/data-cache/index500-predict/stock_panel_days_v1"
     # Create output run directory under repo report folder.
     run_id = dt.datetime.now().strftime("run_%Y%m%d_%H%M%S")
     report_dir = os.path.join(repo_root, "report", run_id)
@@ -371,27 +357,130 @@ def main() -> None:
 
     # Discover available dates and keep only those needed for train/test.
     all_dates = list_available_dates_from_etf1m_dir(etf1m_dir=etf1m_root)
-    dates_needed = [d for d in all_dates if (train_start <= d <= train_end) or (d >= test_start)]
-    print(f"[INFO] Available dates={len(all_dates)}, using dates={len(dates_needed)}.")
+    train_dates, test_dates = choose_train_test_dates(
+        all_dates=all_dates,
+        train_start=train_start,
+        train_end=train_end,
+        test_start=test_start,
+        max_train_days=max_train_days,
+        max_test_days=max_test_days,
+    )
+    dates_needed = list(train_dates) + list(test_dates)
+    print(f"[INFO] Available dates={len(all_dates)}, using train_dates={len(train_dates)}, test_dates={len(test_dates)}.")
 
     # Load weights once for all dates.
     weights = load_index_weights(weight_path=weight_path)
-    print(f"[INFO] Loaded weights rows={len(weights)}. trade_date_min={weights['trade_date'].min()} trade_date_max={weights['trade_date'].max()}.")
+    print(
+        f"[INFO] Loaded weights rows={len(weights)}. trade_date_min={weights['trade_date'].min()} trade_date_max={weights['trade_date'].max()}."
+    )
 
-    # Build full dataset with cached day frames.
-    dataset = build_full_dataset(
+    # Stage 1: Build stock panel parquet (primary deliverable).
+    stock_panel_path = os.path.join(report_dir, "stock_panel.parquet")
+    stock_panel_meta = write_stock_panel_parquet(
         dates=dates_needed,
         weights=weights,
-        cache_root=cache_root,
-        etf1m_root=etf1m_root,
         stock1m_root=stock1m_root,
+        horizon_minutes=label_horizon_minutes,
+        cache_root=stock_panel_cache_root,
+        out_path=stock_panel_path,
+    )
+    stock_feature_cols = stock_panel_meta["feature_cols"]
+    print(f"[INFO] Stock panel rows_written={int(stock_panel_meta['rows_written'])}.")
+
+    # Stage 2: Fit stock-level models on a deterministic subsample.
+    train_sample = collect_stock_training_sample(
+        dates=list(train_dates),
+        weights=weights,
+        stock1m_root=stock1m_root,
+        horizon_minutes=label_horizon_minutes,
+        cache_root=stock_panel_cache_root,
+        feature_cols=stock_feature_cols,
+        max_rows=2_000_000,
+        sample_mod=20,
+    )
+    train_sample = train_sample.rename(columns={"label_stock_10m": "label"})
+    train_sample["month"] = (train_sample["date"].astype(int) // 100).astype(int)
+    val_month = int(train_sample["month"].max())
+    val = train_sample.loc[train_sample["month"] == val_month].copy()
+    train_fit = train_sample.loc[train_sample["month"] < val_month].copy()
+    print(f"[INFO] Stock train_fit rows={len(train_fit)}, val rows={len(val)} (sampled).")
+
+    # Stage 2: Train the required Linear + XGB unified panel models.
+    stock_linear_features = ["ret_1m", "ret_5m", "ret_10m", "ret_30m", "ret_1m_rel_basket", "rank_ret_1m", "weight"]
+    stock_linear_model = fit_linear_baseline(train=train_fit, features=stock_linear_features)
+    stock_xgb_model = fit_xgb_model(train=train_fit, val=val, features=stock_feature_cols, seed=seed)
+
+    # Stage 2: Generate stock metrics (test) and basket predictions (train+test).
+    minute_ic_tables: list[pd.DataFrame] = []
+    basket_rows: list[pd.DataFrame] = []
+    for date in dates_needed:
+        # Load cached day panel and keep train/test rows only.
+        day = load_or_build_stock_panel_day(
+            date=int(date),
+            weights=weights,
+            stock1m_root=stock1m_root,
+            horizon_minutes=label_horizon_minutes,
+            cache_root=stock_panel_cache_root,
+        )
+        day = day.loc[day["split"].isin(["train", "test"])].copy()
+        day = day.dropna(subset=["label_stock_10m"])
+
+        # Predict stock returns with the panel XGB model.
+        xgb_pred = stock_xgb_model.predict(day[stock_feature_cols].to_numpy())
+
+        # Predict stock returns with the panel Linear model on its feature subset.
+        lin_pred = np.full(shape=(len(day),), fill_value=np.nan, dtype=float)
+        lin_mask = day[stock_linear_features].notna().all(axis=1).to_numpy()
+        lin_pred[lin_mask] = stock_linear_model.predict(day.loc[lin_mask, stock_linear_features].to_numpy())
+
+        # Compute stock-level panel IC tables for the test split only.
+        if str(day["split"].iloc[0]) == "test":
+            minute_ic_tables.append(compute_panel_ic_by_minute(day_panel=day, pred=xgb_pred, label_col="label_stock_10m"))
+
+        # Aggregate stock predictions into basket-level minute predictions.
+        basket_xgb = aggregate_day_to_basket(stock_day=day, pred=xgb_pred, pred_col_name="pred_stock_xgb")
+        basket_xgb["model_name"] = "basket_stock_xgb"
+        basket_lin = aggregate_day_to_basket(stock_day=day, pred=lin_pred, pred_col_name="pred_stock_linear")
+        basket_lin["model_name"] = "basket_stock_linear"
+        basket_rows.append(pd.concat([basket_xgb, basket_lin], axis=0, ignore_index=True))
+
+    # Stage 3: Evaluate Stock Alpha and write basket_pred.parquet (deliverable).
+    minute_ic = pd.concat(minute_ic_tables, axis=0, ignore_index=True)
+    daily_ic = summarize_panel_ic_daily(minute_ic=minute_ic)
+    bucket_ic = summarize_panel_ic_by_minute_bucket(minute_ic=minute_ic, bucket_size=30)
+    bucket_ic["minute_bucket"] = bucket_ic["minute_bucket"].astype(int)
+    stock_alpha_metrics = {
+        "panel_ic_test_mean": float(minute_ic["ic"].mean()),
+        "panel_rank_ic_test_mean": float(minute_ic["rank_ic"].mean()),
+        "daily_ic_test_mean": float(daily_ic["ic_mean"].mean()),
+        "daily_rank_ic_test_mean": float(daily_ic["rank_ic_mean"].mean()),
+        "minute_bucket_ic_test": bucket_ic.to_dict(orient="records"),
+    }
+
+    basket_all = pd.concat(basket_rows, axis=0, ignore_index=True)
+    basket_pred_path = os.path.join(report_dir, "basket_pred.parquet")
+    basket_all.to_parquet(basket_pred_path, index=False)
+    basket_pred_tables: list[pd.DataFrame] = []
+    for model_name, part in basket_all.groupby("model_name", sort=True):
+        basket_pred_tables.append(make_basket_prediction_table(basket=part, model_name=str(model_name)))
+    basket_pred_table = pd.concat(basket_pred_tables, axis=0, ignore_index=True)
+    basket_metrics = compute_metrics(pred_table=basket_pred_table)
+
+    # Stage 4: Fit basis models and synthesize ETF predictions for multiple branches.
+    etf_dataset = build_etf_minute_dataset(
+        dates=dates_needed,
+        etf1m_root=etf1m_root,
         etf_code_int=etf_code_int,
         horizon_minutes=label_horizon_minutes,
     )
-    print(f"[INFO] Full dataset rows={len(dataset)} cols={len(dataset.columns)}.")
+    basket_xgb = basket_all.loc[basket_all["model_name"] == "basket_stock_xgb", ["date", "datetime", "basket_pred"]].copy()
+    basket_lin = basket_all.loc[
+        basket_all["model_name"] == "basket_stock_linear",
+        ["date", "datetime", "basket_pred"],
+    ].copy()
 
-    # Define features and create time-based train/val split within training range.
-    feature_cols = [
+    # Stage 4: Define basis feature set shared by all branches.
+    basis_features = [
         "ret_1m",
         "ret_5m",
         "ret_10m",
@@ -403,185 +492,175 @@ def main() -> None:
         "vol_roll_std_20",
         "amt_roll_mean_20",
         "amt_roll_std_20",
-        "minute_index",
-        "minute_sin",
-        "minute_cos",
-        "comp_w_ret_1m",
-        "comp_w_vol_chg_1m",
-        "comp_xs_ret_std_1m",
-        "comp_breadth_pos_ret_1m",
-        "etf_minus_comp_ret_1m",
+        "MinuteIndex",
+        "basket_pred",
     ]
-    train = dataset.loc[dataset["split"] == "train"].copy()
-    test = dataset.loc[dataset["split"] == "test"].copy()
 
-    # Create a time-ordered validation month for early stopping (no hard-coded dates).
-    train_month = (train["date"].astype(int) // 100).astype(int)
-    months = np.sort(train_month.unique())
-    val_month = int(months[-1])
-    val = train.loc[train_month == val_month].copy()
-    train_fit = train.loc[train_month < val_month].copy()
-    print(f"[INFO] Train fit rows={len(train_fit)}, val rows={len(val)}, test rows={len(test)}.")
-
-    # Run walk-forward validation on the training split to check stability across regimes.
-    walk_forward_rows = run_walk_forward_validation(train=train, features=feature_cols, seed=seed, min_train_months=12)
-    print(f"[INFO] Walk-forward folds={len(walk_forward_rows)} (monthly, expanding window).")
-
-    # Compute naive baselines.
-    dataset_with_baselines = compute_baseline_preds(frame=dataset, horizon_minutes=label_horizon_minutes)
-
-    # Fit linear model baseline and generate its predictions.
-    lin_features = ["ret_1m", "ret_5m", "ret_10m", "ret_30m"]
-    linear_model = fit_linear_baseline(train=train_fit, features=lin_features)
-    linear_pred = np.full(shape=(len(dataset_with_baselines),), fill_value=np.nan, dtype=float)
-    linear_mask = dataset_with_baselines[lin_features].notna().all(axis=1).to_numpy()
-    linear_pred[linear_mask] = linear_model.predict(dataset_with_baselines.loc[linear_mask, lin_features].to_numpy())
-    dataset_with_baselines["pred_linear_model"] = linear_pred
-
-    # Fit main model and generate predictions.
-    xgb_model = fit_xgb_model(train=train_fit, val=val, features=feature_cols, seed=seed)
-    xgb_pred = xgb_model.predict(dataset_with_baselines[feature_cols].to_numpy())
-    dataset_with_baselines["pred_xgb"] = xgb_pred
-
-    # Assemble long-form prediction tables for all models.
-    pred_tables: list[pd.DataFrame] = []
-    pred_tables.append(make_prediction_table(dataset_with_baselines, "zero", dataset_with_baselines["pred_zero"].to_numpy()))
-    pred_tables.append(
-        make_prediction_table(dataset_with_baselines, "last_value", dataset_with_baselines["pred_last_value"].to_numpy())
-    )
-    pred_tables.append(
-        make_prediction_table(dataset_with_baselines, "rolling_mean", dataset_with_baselines["pred_rolling_mean"].to_numpy())
-    )
-    pred_tables.append(
-        make_prediction_table(dataset_with_baselines, "linear_model", dataset_with_baselines["pred_linear_model"].to_numpy())
-    )
-    pred_tables.append(make_prediction_table(dataset_with_baselines, "xgb", dataset_with_baselines["pred_xgb"].to_numpy()))
-    predictions = pd.concat(pred_tables, axis=0, ignore_index=True)
-
-    # Write predictions to parquet as required.
-    predictions_path = os.path.join(report_dir, "predictions.parquet")
-    predictions.to_parquet(predictions_path, index=False)
-
-    # Compute metrics and prepare metrics.yaml payload.
-    metrics = compute_metrics(pred_table=predictions)
-    metrics["walk_forward"] = {"xgb": walk_forward_rows}
-    new_features = [
-        "minute_index",
-        "minute_sin",
-        "minute_cos",
-        "amt_chg_1m",
-        "rv_10",
-        "rv_20",
-        "comp_breadth_pos_ret_1m",
-        "etf_minus_comp_ret_1m",
-    ]
-    metrics["feature_ic"] = {"test": compute_feature_ic_table(dataset=dataset, features=new_features, split="test")}
-    metrics["xgb_feature_importance"] = [
-        {"feature": str(name), "importance": float(val)}
-        for name, val in sorted(
-            zip(feature_cols, xgb_model.feature_importances_),
-            key=lambda x: float(x[1]),
-            reverse=True,
+    # Stage 4: Build raw ETF prediction tables for both basket branches.
+    etf_pred_tables: list[pd.DataFrame] = []
+    raw_join_xgb = etf_dataset.merge(basket_xgb, on=["date", "datetime"], how="inner")
+    raw_join_lin = etf_dataset.merge(basket_lin, on=["date", "datetime"], how="inner")
+    etf_pred_tables.append(
+        make_etf_prediction_table(
+            frame=raw_join_xgb,
+            model_name="raw_basket_stock_xgb_vs_etf",
+            pred=raw_join_xgb["basket_pred"].to_numpy(dtype=float),
+            label_col="label_etf_10m",
         )
-    ]
+    )
+    etf_pred_tables.append(
+        make_etf_prediction_table(
+            frame=raw_join_lin,
+            model_name="raw_basket_stock_linear_vs_etf",
+            pred=raw_join_lin["basket_pred"].to_numpy(dtype=float),
+            label_col="label_etf_10m",
+        )
+    )
 
-    # Compute coverage audit once and persist the summary into metrics for the main report.
-    coverage_audit = compute_coverage_audit_tables(dataset=dataset)
-    metrics["data_audit_summary"] = {
-        "overall_join_retention_mean": float(coverage_audit["overall"]["join_retention_mean"]),
-        "first_minute_weight_coverage_mean": float(coverage_audit["first_minute"]["weight_coverage_mean"]),
-        "first_minute_missing_rate_mean": float(coverage_audit["first_minute"]["missing_rate_mean"]),
-        "first_minute_join_retention_mean": float(coverage_audit["first_minute"]["join_retention_mean"]),
-        "last_minute_weight_coverage_mean": float(coverage_audit["last_minute"]["weight_coverage_mean"]),
-        "last_minute_missing_rate_mean": float(coverage_audit["last_minute"]["missing_rate_mean"]),
-        "last_minute_join_retention_mean": float(coverage_audit["last_minute"]["join_retention_mean"]),
-    }
+    # Stage 4: Fit basis_linear per branch and synthesize corrected ETF predictions.
+    basis_pairs: list[tuple[str, str]] = []
+    for raw_model_name, joined in [
+        ("raw_basket_stock_xgb_vs_etf", raw_join_xgb),
+        ("raw_basket_stock_linear_vs_etf", raw_join_lin),
+    ]:
+        # Build residual label and clean infinities for linear regression stability.
+        joined = joined.copy()
+        joined["basis_realized"] = joined["label_etf_10m"] - joined["basket_pred"]
+        joined = joined.replace([np.inf, -np.inf], np.nan)
 
-    # Write metrics.yaml after all report-relevant summaries are attached.
-    write_yaml(os.path.join(report_dir, "metrics.yaml"), metrics)
+        # Fit linear basis model on train split for this branch.
+        basis_train = joined.loc[joined["split"] == "train"].copy()
+        basis_model = fit_basis_linear_model(train=basis_train, features=basis_features, label_col="basis_realized")
 
-    # Write data audit and spot checks.
-    first_train_date = int(min([d for d in dates_needed if 20210101 <= d <= 20231231]))
-    last_train_date = int(max([d for d in dates_needed if 20210101 <= d <= 20231231]))
-    first_test_date = int(min([d for d in dates_needed if d >= test_start]))
-    spot_dates = [first_train_date, last_train_date, first_test_date]
-    spot_checks: list[dict] = []
-    for date in spot_dates:
-        spot_checks.extend(
-            sample_spot_checks(
-                etf1m_root=etf1m_root,
-                date=date,
-                etf_code_int=etf_code_int,
-                num_checks=1,
-                horizon_minutes=label_horizon_minutes,
+        # Predict basis and form bottom-up corrected prediction.
+        basis_pred = np.full(shape=(len(joined),), fill_value=np.nan, dtype=float)
+        basis_mask = np.isfinite(joined[basis_features].to_numpy(dtype=float)).all(axis=1)
+        basis_pred[basis_mask] = basis_model.predict(joined.loc[basis_mask, basis_features].to_numpy())
+        bottom_up_pred = joined["basket_pred"].to_numpy(dtype=float) + basis_pred
+
+        # Map raw model name to the required plus-basis naming in AGENTS.md.
+        if str(raw_model_name) == "raw_basket_stock_xgb_vs_etf":
+            basis_model_name = "basket_stock_xgb_plus_basis"
+        else:
+            basis_model_name = "basket_stock_linear_plus_basis"
+        basis_pairs.append((str(raw_model_name), str(basis_model_name)))
+
+        # Append basis-corrected ETF prediction table.
+        etf_pred_tables.append(
+            make_etf_prediction_table(
+                frame=joined,
+                model_name=basis_model_name,
+                pred=bottom_up_pred,
+                label_col="label_etf_10m",
             )
         )
-    write_data_audit_md(
-        report_dir=report_dir,
-        spot_checks=spot_checks,
-        horizon_minutes=label_horizon_minutes,
-        coverage_audit=coverage_audit,
+
+    # Stage 4: Add benchmark baselines on the ETF label series.
+    baseline_frame = etf_dataset.loc[:, ["datetime", "split", "label_etf_10m"]].copy()
+    baseline_frame = baseline_frame.rename(columns={"datetime": "DateTime", "label_etf_10m": "label"})
+    baseline_with_preds = compute_baseline_preds(frame=baseline_frame, horizon_minutes=label_horizon_minutes)
+    etf_pred_tables.append(
+        make_etf_prediction_table(
+            frame=etf_dataset,
+            model_name="benchmark_zero",
+            pred=baseline_with_preds["pred_zero"].to_numpy(dtype=float),
+            label_col="label_etf_10m",
+        )
+    )
+    etf_pred_tables.append(
+        make_etf_prediction_table(
+            frame=etf_dataset,
+            model_name="benchmark_last_value",
+            pred=baseline_with_preds["pred_last_value"].to_numpy(dtype=float),
+            label_col="label_etf_10m",
+        )
+    )
+    etf_pred_tables.append(
+        make_etf_prediction_table(
+            frame=etf_dataset,
+            model_name="benchmark_rolling_mean_20",
+            pred=baseline_with_preds["pred_rolling_mean"].to_numpy(dtype=float),
+            label_col="label_etf_10m",
+        )
     )
 
-    # Write summary and report markdown.
-    write_summary_md(report_dir=report_dir, run_id=run_id, metrics=metrics, feature_cols=feature_cols)
-    write_report_md(report_dir=report_dir, run_id=run_id, metrics=metrics)
-    write_report_tex(
-        report_dir=os.path.join(repo_root, "report"),
-        run_id=run_id,
-        metrics=metrics,
-        out_name="report0318.tex",
-        asset_prefix=run_id,
-    )
-    write_report_tex(
-        report_dir=report_dir,
-        run_id=run_id,
-        metrics=metrics,
-        out_name="report0318.tex",
-        asset_prefix="",
-    )
+    # Stage 5: Compute ETF-level metrics and write predictions parquet.
+    etf_pred_table = pd.concat(etf_pred_tables, axis=0, ignore_index=True)
+    etf_pred_path = os.path.join(report_dir, "predictions.parquet")
+    etf_pred_table.to_parquet(etf_pred_path, index=False)
+    etf_metrics = compute_metrics(pred_table=etf_pred_table)
 
-    # Create figures based on the main model daily series.
-    daily_merged = pd.DataFrame(metrics["rolling"]["xgb"])
+    # Stage 5: Choose the best model by ETF test RankIC (selection rule in AGENTS.md).
+    best_model = pick_best_model_by_metric(etf_overall=etf_metrics["overall"], split="test", metric_name="rank_ic")
+    best_row = etf_metrics["overall"][best_model]["test"]
+    raw_vs_basis_delta_test = compute_raw_vs_basis_delta_test(etf_overall=etf_metrics["overall"], pairs=basis_pairs)
+
+    # Stage 5: Assemble one metrics.yaml for the full three-layer evaluation.
+    metrics = {
+        "config": {
+            "seed": int(seed),
+            "etf_code_int": int(etf_code_int),
+            "label_horizon_minutes": int(label_horizon_minutes),
+            "train_range": [int(train_start), int(train_end)],
+            "test_start": int(test_start),
+            "used_train_days": int(len(train_dates)),
+            "used_test_days": int(len(test_dates)),
+        },
+        "stock_alpha": stock_alpha_metrics,
+        "basket_synthesis": {"overall": basket_metrics["overall"]},
+        "etf_level": {"overall": etf_metrics["overall"], "raw_vs_basis_delta_test": raw_vs_basis_delta_test},
+        "selection": {
+            "selection_key": "test_rank_ic",
+            "selected_model": str(best_model),
+            "selected_test_ic": float(best_row["ic"]),
+            "selected_test_rank_ic": float(best_row["rank_ic"]),
+            "selected_test_rmse": float(best_row["rmse"]),
+            "selected_test_mae": float(best_row["mae"]),
+        },
+    }
+    write_yaml(os.path.join(report_dir, "metrics.yaml"), metrics)
+    write_bottom_up_report_md(report_dir=report_dir, run_id=run_id, metrics=metrics)
+
+    # Stage 5: Create stable top-level deliverable links for the caller.
+    for name, target in [
+        ("stock_panel.parquet", stock_panel_path),
+        ("basket_pred.parquet", basket_pred_path),
+    ]:
+        out_path = os.path.join(repo_root, name)
+        if os.path.islink(out_path) or os.path.exists(out_path):
+            os.remove(out_path)
+        os.symlink(target, out_path)
+
+    # Stage 5: Plot unified comparisons and stability figures for report.md.
+    plot_baseline_comparison(metrics=basket_metrics, split="test", out_path=os.path.join(report_dir, "fig_basket_branch_compare_test.png"))
+    plot_baseline_comparison(metrics=etf_metrics, split="test", out_path=os.path.join(report_dir, "fig_etf_branch_compare_test.png"))
+    plot_raw_vs_basis_delta(
+        overall_metrics=etf_metrics["overall"],
+        split="test",
+        pairs=basis_pairs,
+        out_path=os.path.join(report_dir, "fig_raw_vs_basis_delta_test.png"),
+    )
+    best_daily = pd.DataFrame(etf_metrics["rolling"][best_model]).copy()
     plot_daily_timeseries(
-        daily=daily_merged,
+        daily=best_daily,
         value_col="ic",
         roll_20_col="ic_roll_20",
         roll_60_col="ic_roll_60",
-        title="Daily IC (test)",
-        out_path=os.path.join(report_dir, "fig_ic_timeseries.png"),
+        title=f"Daily IC ({best_model}, test)",
+        out_path=os.path.join(report_dir, "fig_best_daily_ic.png"),
     )
     plot_cumulative_metric(
-        daily=daily_merged,
+        daily=pd.DataFrame(etf_metrics["daily"][best_model]).copy(),
         value_col="ic",
-        title="Cumulative IC (test)",
-        out_path=os.path.join(report_dir, "fig_ic_cum.png"),
+        title=f"Cumulative IC ({best_model}, test)",
+        out_path=os.path.join(report_dir, "fig_best_cum_ic.png"),
     )
-    plot_daily_timeseries(
-        daily=daily_merged,
-        value_col="rank_ic",
-        roll_20_col="rank_ic_roll_20",
-        roll_60_col="rank_ic_roll_60",
-        title="Daily Rank IC (test)",
-        out_path=os.path.join(report_dir, "fig_rank_ic_timeseries.png"),
-    )
-    plot_daily_timeseries(
-        daily=daily_merged,
-        value_col="direction_acc",
-        roll_20_col="dir_acc_roll_20",
-        roll_60_col="dir_acc_roll_60",
-        title="Daily Direction Accuracy (test)",
-        out_path=os.path.join(report_dir, "fig_direction_acc_timeseries.png"),
-    )
-    plot_baseline_comparison(metrics=metrics, split="test", out_path=os.path.join(report_dir, "fig_baseline_comparison.png"))
-    plot_feature_importance(
-        importances=metrics["xgb_feature_importance"],
-        out_path=os.path.join(report_dir, "fig_xgb_feature_importance.png"),
-        top_k=20,
-    )
-    plot_prediction_scatter(pred_table=predictions, model_name="xgb", out_path=os.path.join(report_dir, "fig_prediction_scatter.png"))
-    plot_prediction_timeseries(
-        pred_table=predictions, model_name="xgb", out_path=os.path.join(report_dir, "fig_prediction_timeseries.png")
+    best_monthly = pd.DataFrame(etf_metrics["by_month"][best_model]).copy()
+    plot_monthly_timeseries(
+        monthly=best_monthly,
+        value_col="ic",
+        title=f"Monthly IC ({best_model}, test)",
+        out_path=os.path.join(report_dir, "fig_best_monthly_ic.png"),
     )
 
     # Print final report directory for the caller.

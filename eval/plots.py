@@ -125,3 +125,67 @@ def plot_cumulative_metric(daily: pd.DataFrame, value_col: str, title: str, out_
     plt.tight_layout()
     plt.savefig(out_path)
     plt.close()
+
+
+def plot_monthly_timeseries(
+    monthly: pd.DataFrame,
+    value_col: str,
+    title: str,
+    out_path: str,
+) -> None:
+    """Plot monthly metric timeseries."""
+
+    # Convert YYYYMM into a month-start datetime index for plotting.
+    months = monthly["month"].astype(int)
+    dates = pd.to_datetime(months.astype(str) + "01", format="%Y%m%d")
+
+    # Create and save a compact line plot.
+    plt.figure(figsize=(12, 4))
+    plt.plot(dates, monthly[value_col], label=value_col, linewidth=1.2, marker="o", markersize=3)
+    plt.title(title)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(out_path)
+    plt.close()
+
+
+def plot_raw_vs_basis_delta(
+    overall_metrics: dict,
+    split: str,
+    pairs: list[tuple[str, str]],
+    out_path: str,
+) -> None:
+    """Plot IC/RankIC deltas between raw and basis-corrected models."""
+
+    # Build a small table of deltas for each (raw, basis) pair.
+    rows: list[dict] = []
+    for raw_name, basis_name in pairs:
+        # Pull split metrics for both models.
+        raw_row = overall_metrics.get(raw_name, {}).get(split, {})
+        basis_row = overall_metrics.get(basis_name, {}).get(split, {})
+        rows.append(
+            {
+                "pair": f"{raw_name} -> {basis_name}",
+                "ic_delta": float(basis_row.get("ic", np.nan)) - float(raw_row.get("ic", np.nan)),
+                "rank_ic_delta": float(basis_row.get("rank_ic", np.nan)) - float(raw_row.get("rank_ic", np.nan)),
+            }
+        )
+    table = pd.DataFrame(rows).copy()
+
+    # Plot two-panel bars for IC and RankIC deltas.
+    plt.figure(figsize=(12, 4))
+    ax1 = plt.subplot(1, 2, 1)
+    ax1.bar(table["pair"], table["ic_delta"])
+    ax1.axhline(0.0, color="black", linewidth=0.8)
+    ax1.set_title(f"IC Delta (basis - raw, {split})")
+    ax1.tick_params(axis="x", rotation=45)
+
+    ax2 = plt.subplot(1, 2, 2)
+    ax2.bar(table["pair"], table["rank_ic_delta"])
+    ax2.axhline(0.0, color="black", linewidth=0.8)
+    ax2.set_title(f"RankIC Delta (basis - raw, {split})")
+    ax2.tick_params(axis="x", rotation=45)
+
+    plt.tight_layout()
+    plt.savefig(out_path)
+    plt.close()
