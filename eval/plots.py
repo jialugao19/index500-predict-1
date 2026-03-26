@@ -91,7 +91,7 @@ def plot_prediction_timeseries(pred_table: pd.DataFrame, model_name: str, out_pa
     plt.close()
 
 
-def plot_feature_importance(importances: list[dict], out_path: str, top_k: int) -> None:
+def plot_feature_importance(importances: list[dict], out_path: str, top_k: int, title: str) -> None:
     """Plot a horizontal bar chart of top-K feature importances."""
 
     # Convert importance rows into a sorted DataFrame.
@@ -102,7 +102,7 @@ def plot_feature_importance(importances: list[dict], out_path: str, top_k: int) 
     # Draw a compact barh chart to show relative magnitudes.
     plt.figure(figsize=(8, 6))
     plt.barh(table["feature"][::-1], table["importance"][::-1])
-    plt.title(f"XGB Feature Importance (Top {int(top_k)})")
+    plt.title(f"{str(title)} (Top {int(top_k)})")
     plt.xlabel("importance")
     plt.tight_layout()
     plt.savefig(out_path)
@@ -186,6 +186,22 @@ def plot_raw_vs_basis_delta(
     ax2.set_title(f"RankIC Delta (basis - raw, {split})")
     ax2.tick_params(axis="x", rotation=45)
 
+    plt.tight_layout()
+    plt.savefig(out_path)
+    plt.close()
+
+
+def plot_histogram(values: np.ndarray, bins: int, title: str, out_path: str) -> None:
+    """Plot a simple histogram for a 1D numeric series."""
+
+    # Keep only finite values for stable histogram rendering.
+    vals = np.asarray(values, dtype=float)
+    vals = vals[np.isfinite(vals)]
+
+    # Draw and save a compact histogram.
+    plt.figure(figsize=(8, 4))
+    plt.hist(vals, bins=int(bins), alpha=0.85)
+    plt.title(title)
     plt.tight_layout()
     plt.savefig(out_path)
     plt.close()

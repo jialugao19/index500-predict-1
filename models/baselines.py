@@ -1,6 +1,6 @@
 import numpy as np
 import pandas as pd
-from sklearn.linear_model import LinearRegression
+from sklearn.linear_model import Lasso, LinearRegression, Ridge
 
 
 def fit_linear_baseline(train: pd.DataFrame, features: list[str]) -> LinearRegression:
@@ -15,6 +15,72 @@ def fit_linear_baseline(train: pd.DataFrame, features: list[str]) -> LinearRegre
     model = LinearRegression()
     model.fit(x_train, y_train)
     return model
+
+
+def fit_ridge_regression(train: pd.DataFrame, features: list[str], alpha: float) -> dict:
+    """Fit a Ridge regression baseline with train-only impute and z-score."""
+
+    # Build the raw training matrix and label vector.
+    x_raw = train.loc[:, features].to_numpy(dtype=float)
+    y = train.loc[:, "label"].to_numpy(dtype=float)
+
+    # Compute train-only imputation values for missing entries.
+    impute_values = np.nanmean(x_raw, axis=0)
+    x_imputed = np.where(np.isfinite(x_raw), x_raw, impute_values[None, :])
+
+    # Compute train-only z-score parameters and standardize features.
+    means = np.mean(x_imputed, axis=0)
+    stds = np.std(x_imputed, axis=0)
+    # Stabilize constant features to avoid NaNs from division by zero.
+    stds_safe = np.where(stds == 0.0, 1.0, stds)
+    x = (x_imputed - means[None, :]) / stds_safe[None, :]
+
+    # Fit Ridge regression with an explicit L2 penalty.
+    model = Ridge(alpha=float(alpha), fit_intercept=True, random_state=0)
+    model.fit(x, y)
+    return {"model": model, "impute_values": impute_values, "means": means, "stds": stds_safe, "features": list(features)}
+
+
+def fit_lasso_regression(train: pd.DataFrame, features: list[str], alpha: float) -> dict:
+    """Fit a Lasso regression baseline with train-only impute and z-score."""
+
+    # Build the raw training matrix and label vector.
+    x_raw = train.loc[:, features].to_numpy(dtype=float)
+    y = train.loc[:, "label"].to_numpy(dtype=float)
+
+    # Compute train-only imputation values for missing entries.
+    impute_values = np.nanmean(x_raw, axis=0)
+    x_imputed = np.where(np.isfinite(x_raw), x_raw, impute_values[None, :])
+
+    # Compute train-only z-score parameters and standardize features.
+    means = np.mean(x_imputed, axis=0)
+    stds = np.std(x_imputed, axis=0)
+    # Stabilize constant features to avoid NaNs from division by zero.
+    stds_safe = np.where(stds == 0.0, 1.0, stds)
+    x = (x_imputed - means[None, :]) / stds_safe[None, :]
+
+    # Fit Lasso regression with an explicit L1 penalty.
+    model = Lasso(alpha=float(alpha), fit_intercept=True, max_iter=5000, random_state=0)
+    model.fit(x, y)
+    return {"model": model, "impute_values": impute_values, "means": means, "stds": stds_safe, "features": list(features)}
+
+
+def predict_linear_model(bundle: dict, frame: pd.DataFrame) -> np.ndarray:
+    """Predict with a pre-fitted linear model bundle on a raw feature frame."""
+
+    # Extract bundle components for deterministic preprocessing.
+    features = bundle["features"]
+    model = bundle["model"]
+    impute_values = np.asarray(bundle["impute_values"], dtype=float)
+    means = np.asarray(bundle["means"], dtype=float)
+    stds = np.asarray(bundle["stds"], dtype=float)
+
+    # Build the raw feature matrix and apply the same impute + standardize transforms.
+    x_raw = frame.loc[:, features].to_numpy(dtype=float)
+    x_imputed = np.where(np.isfinite(x_raw), x_raw, impute_values[None, :])
+    x = (x_imputed - means[None, :]) / stds[None, :]
+    pred = model.predict(x).astype(float)
+    return pred
 
 
 def compute_baseline_preds(frame: pd.DataFrame, horizon_minutes: int) -> pd.DataFrame:
@@ -38,4 +104,3 @@ def compute_baseline_preds(frame: pd.DataFrame, horizon_minutes: int) -> pd.Data
     # Recombine split pieces back into one frame.
     combined = pd.concat(pieces, axis=0, ignore_index=True)
     return combined
-

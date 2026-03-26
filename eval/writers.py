@@ -405,6 +405,7 @@ def write_bottom_up_report_md(report_dir: str, run_id: str, metrics: dict) -> No
     lines.append(f"- Horizon minutes: `{int(cfg['label_horizon_minutes'])}`.")
     lines.append(f"- Train range (calendar): `{int(cfg['train_range'][0])}` - `{int(cfg['train_range'][1])}`.")
     lines.append(f"- Test start (calendar): `{int(cfg['test_start'])}`.")
+    lines.append(f"- Test end (calendar): `{int(cfg['test_end'])}`.")
     lines.append(f"- Used train days: `{int(cfg['used_train_days'])}`.")
     lines.append(f"- Used test days: `{int(cfg['used_test_days'])}`.")
     lines.append("")
@@ -417,6 +418,17 @@ def write_bottom_up_report_md(report_dir: str, run_id: str, metrics: dict) -> No
     lines.append(
         f"- Stock XGB daily IC (test, mean over days): IC={float(stock['daily_ic_test_mean']):.6f}, RankIC={float(stock['daily_rank_ic_test_mean']):.6f}."
     )
+    if "overall" in stock:
+        lines.append("")
+        lines.append("### Stock 模型对比 (test)")
+        lines.append("")
+        lines.append("| model | panel_ic_mean | panel_rank_ic_mean | daily_ic_mean | daily_rank_ic_mean | daily_icir | daily_rank_icir |")
+        lines.append("| --- | --- | --- | --- | --- | --- | --- |")
+        for model_name in sorted(stock["overall"].keys()):
+            row = stock["overall"][model_name]
+            lines.append(
+                f"| {model_name} | {float(row['panel_ic_test_mean']):.6f} | {float(row['panel_rank_ic_test_mean']):.6f} | {float(row['daily_ic_test_mean']):.6f} | {float(row['daily_rank_ic_test_mean']):.6f} | {float(row['daily_icir_test']):.3f} | {float(row['daily_rank_icir_test']):.3f} |"
+            )
     lines.append("")
     lines.append("### 分钟 Bucket IC (test)")
     lines.append("")
@@ -427,6 +439,36 @@ def write_bottom_up_report_md(report_dir: str, run_id: str, metrics: dict) -> No
             f"| {int(row['minute_bucket'])} | {float(row['ic_mean']):.6f} | {float(row['rank_ic_mean']):.6f} | {int(row['minutes'])} | {int(row['n_sum'])} |"
         )
     lines.append("")
+    if "per_stock_test" in stock:
+        lines.append("### 个股预测好坏判定 (test)")
+        lines.append("")
+        per_stock = stock["per_stock_test"]
+        lines.append(f"- IC t-threshold: `{float(per_stock['ic_t_threshold']):.2f}`.")
+        lines.append(f"- IC abs-threshold: `{float(per_stock['ic_abs_threshold']):.4f}`.")
+        lines.append(f"- n_stocks: `{int(per_stock['n_stocks'])}`.")
+        lines.append(f"- verdict_counts: `{per_stock['verdict_counts']}`.")
+        lines.append(
+            f"- IC quantiles (q05/q50/q95): `{float(per_stock['ic_quantiles']['q05']):.4f}` / `{float(per_stock['ic_quantiles']['q50']):.4f}` / `{float(per_stock['ic_quantiles']['q95']):.4f}`."
+        )
+        lines.append("")
+        lines.append("#### Top IC (test, per-stock)")
+        lines.append("")
+        lines.append("| stock_code | weight_mean | ic | ic_t | dir_acc | rmse | mae |")
+        lines.append("| --- | --- | --- | --- | --- | --- | --- |")
+        for row in per_stock["top_ic"]:
+            lines.append(
+                f"| {int(row['stock_code'])} | {float(row['weight_mean']):.6f} | {float(row['ic']):.6f} | {float(row['ic_t']):.3f} | {float(row['direction_acc']):.6f} | {float(row['rmse']):.6f} | {float(row['mae']):.6f} |"
+            )
+        lines.append("")
+        lines.append("#### Bottom IC (test, per-stock)")
+        lines.append("")
+        lines.append("| stock_code | weight_mean | ic | ic_t | dir_acc | rmse | mae |")
+        lines.append("| --- | --- | --- | --- | --- | --- | --- |")
+        for row in per_stock["bottom_ic"]:
+            lines.append(
+                f"| {int(row['stock_code'])} | {float(row['weight_mean']):.6f} | {float(row['ic']):.6f} | {float(row['ic_t']):.3f} | {float(row['direction_acc']):.6f} | {float(row['rmse']):.6f} | {float(row['mae']):.6f} |"
+            )
+        lines.append("")
     lines.append("## Part 2: Synthesis (合成端, Basket)")
     lines.append("")
     basket = metrics["basket_synthesis"]["overall"]
@@ -438,7 +480,51 @@ def write_bottom_up_report_md(report_dir: str, run_id: str, metrics: dict) -> No
             f"| {model_name} | {float(row['ic']):.6f} | {float(row['rank_ic']):.6f} | {float(row['direction_acc']):.6f} | {float(row['rmse']):.6f} | {float(row['mae']):.6f} | {int(row['n'])} |"
         )
     lines.append("")
-    lines.append("## Part 3: ETF (ETF 端)")
+    if "basis_eval" in metrics:
+        lines.append("## Part 3: Basis (Basket 预测 vs 真实 ETF)")
+        lines.append("")
+        basis = metrics["basis_eval"]["overall"]
+        lines.append("| model | ic | icir | rank_ic | rank_icir | dir_acc | rmse | mae | n |")
+        lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- |")
+        for model_name in sorted(basis.keys()):
+            row = basis[model_name]["test"]
+            lines.append(
+                f"| {model_name} | {float(row['ic']):.6f} | {float(row['icir']):.3f} | {float(row['rank_ic']):.6f} | {float(row['rank_icir']):.3f} | {float(row['direction_acc']):.6f} | {float(row['rmse']):.6f} | {float(row['mae']):.6f} | {int(row['n'])} |"
+            )
+        lines.append("")
+        lines.append("### Basis 选型结论 (Selection)")
+        lines.append("")
+        sel = metrics["selection"]
+        lines.append(f"- Selected model: `{sel['selected_model']}` (by `{sel['selection_key']}` on test).")
+        lines.append(
+            f"- Selected test metrics: IC=`{float(sel['selected_test_ic']):.6f}`, RankIC=`{float(sel['selected_test_rank_ic']):.6f}`, RMSE=`{float(sel['selected_test_rmse']):.6f}`, MAE=`{float(sel['selected_test_mae']):.6f}`."
+        )
+        lines.append("")
+    if "synthetic_vs_real_etf" in metrics:
+        lines.append("## Synthetic vs Real ETF (合成收益 vs 真实 ETF 收益)")
+        lines.append("")
+        synth = metrics["synthetic_vs_real_etf"]
+        test = synth["overall"]["test"]
+        lines.append(
+            f"- Test: IC={float(test['ic']):.6f}, RankIC={float(test['rank_ic']):.6f}, DirAcc={float(test['direction_acc']):.6f}, RMSE={float(test['rmse']):.6f}, MAE={float(test['mae']):.6f}, n={int(test['n'])}."
+        )
+        lines.append(
+            f"- Bias (mean/std): `{float(test['bias_mean']):.8f}` / `{float(test['bias_std']):.8f}`; err_q05/q50/q95: `{float(test['err_q05']):.8f}` / `{float(test['err_q50']):.8f}` / `{float(test['err_q95']):.8f}`."
+        )
+        lines.append(
+            f"- OLS y=a+b*x (x=basket_label, y=etf_label): intercept=`{float(test['ols']['intercept']):.8f}`, slope=`{float(test['ols']['slope']):.6f}`, r2=`{float(test['ols']['r2']):.6f}`."
+        )
+        lines.append("")
+        lines.append("### 分钟 Bucket 误差诊断 (test)")
+        lines.append("")
+        lines.append("| minute_bucket | ic | rank_ic | rmse | mae | bias_mean | bias_std | n |")
+        lines.append("| --- | --- | --- | --- | --- | --- | --- | --- |")
+        for row in synth["minute_bucket_test"]:
+            lines.append(
+                f"| {int(row['minute_bucket'])} | {float(row['ic']):.6f} | {float(row['rank_ic']):.6f} | {float(row['rmse']):.6f} | {float(row['mae']):.6f} | {float(row['bias_mean']):.8f} | {float(row['bias_std']):.8f} | {int(row['n'])} |"
+            )
+        lines.append("")
+    lines.append("## Part 4: ETF (ETF 端)")
     lines.append("")
     etf = metrics["etf_level"]["overall"]
     lines.append("| model | ic | rank_ic | dir_acc | rmse | mae | n |")
@@ -449,14 +535,15 @@ def write_bottom_up_report_md(report_dir: str, run_id: str, metrics: dict) -> No
             f"| {model_name} | {float(row['ic']):.6f} | {float(row['rank_ic']):.6f} | {float(row['direction_acc']):.6f} | {float(row['rmse']):.6f} | {float(row['mae']):.6f} | {int(row['n'])} |"
         )
     lines.append("")
-    lines.append("### 选型结论 (Selection)")
-    lines.append("")
-    sel = metrics["selection"]
-    lines.append(f"- Selected model: `{sel['selected_model']}` (by `{sel['selection_key']}` on test).")
-    lines.append(
-        f"- Selected test metrics: IC=`{float(sel['selected_test_ic']):.6f}`, RankIC=`{float(sel['selected_test_rank_ic']):.6f}`, RMSE=`{float(sel['selected_test_rmse']):.6f}`, MAE=`{float(sel['selected_test_mae']):.6f}`."
-    )
-    lines.append("")
+    if "selection_etf" in metrics:
+        lines.append("### ETF 选型结论 (Selection)")
+        lines.append("")
+        sel = metrics["selection_etf"]
+        lines.append(f"- Selected model: `{sel['selected_model']}` (by `{sel['selection_key']}` on test).")
+        lines.append(
+            f"- Selected test metrics: IC=`{float(sel['selected_test_ic']):.6f}`, RankIC=`{float(sel['selected_test_rank_ic']):.6f}`, RMSE=`{float(sel['selected_test_rmse']):.6f}`, MAE=`{float(sel['selected_test_mae']):.6f}`."
+        )
+        lines.append("")
     lines.append("### Raw vs Basis (Delta, test)")
     lines.append("")
     lines.append("| raw_model | basis_model | ic_delta | rank_ic_delta |")
@@ -472,14 +559,29 @@ def write_bottom_up_report_md(report_dir: str, run_id: str, metrics: dict) -> No
     lines.append("")
     lines.append("![ETF branch comparison (test)](fig_etf_branch_compare_test.png)")
     lines.append("")
+    if "feature_importance" in metrics.get("stock_alpha", {}):
+        lines.append("![Stock XGB feature importance](fig_stock_xgb_feature_importance.png)")
+        lines.append("")
+        lines.append("![Stock LightGBM feature importance](fig_stock_lgbm_feature_importance.png)")
+        lines.append("")
     lines.append("![Raw vs basis delta (test)](fig_raw_vs_basis_delta_test.png)")
     lines.append("")
+    if "basis_eval" in metrics:
+        lines.append("![Best basis-corrected daily IC (test)](fig_basis_corrected_best_daily_ic.png)")
+        lines.append("")
     lines.append("![Best model daily IC (test)](fig_best_daily_ic.png)")
     lines.append("")
     lines.append("![Best model cumulative IC (test)](fig_best_cum_ic.png)")
     lines.append("")
     lines.append("![Best model monthly IC (test)](fig_best_monthly_ic.png)")
     lines.append("")
+    if "synthetic_vs_real_etf" in metrics:
+        lines.append("![Synthetic vs Real scatter (test)](fig_synth_vs_real_scatter_test.png)")
+        lines.append("")
+        lines.append("![Synthetic vs Real error hist (test)](fig_synth_vs_real_error_hist_test.png)")
+        lines.append("")
+        lines.append("![Synthetic vs Real daily delta (test)](fig_synth_vs_real_daily_delta_test.png)")
+        lines.append("")
 
     # Write to file.
     out_path = os.path.join(report_dir, "report.md")

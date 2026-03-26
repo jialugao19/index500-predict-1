@@ -7,17 +7,28 @@ import time
 import numpy as np
 import pandas as pd
 
-from eval.metrics import compute_metrics
+from eval.metrics import (
+    compute_error_summary,
+    compute_metrics,
+    compute_ols_summary,
+    safe_corr,
+    safe_spearman,
+    summarize_error_by_minute_bucket,
+)
 from eval.feature_importance import compute_feature_ic_table
 from eval.stock_level import (
+    compute_stock_sufficient_stats,
+    compute_stock_daily_ic_table,
     compute_panel_ic_by_minute,
+    finalize_stock_metrics_from_sufficient_stats,
     summarize_panel_ic_by_minute_bucket,
     summarize_panel_ic_daily,
 )
 from eval.walk_forward import run_walk_forward_validation
 from features.etf import compute_etf_features, compute_label_from_close
-from models.baselines import compute_baseline_preds, fit_linear_baseline
+from models.baselines import compute_baseline_preds, fit_lasso_regression, fit_ridge_regression, predict_linear_model
 from models.basis import fit_basis_linear_model
+from models.lgbm import fit_lgbm_model
 from models.xgb import fit_xgb_model
 from eval.plots import (
     plot_baseline_comparison,
@@ -27,6 +38,7 @@ from eval.plots import (
     plot_monthly_timeseries,
     plot_prediction_scatter,
     plot_prediction_timeseries,
+    plot_histogram,
     plot_raw_vs_basis_delta,
 )
 from eval.writers import (
@@ -223,14 +235,9 @@ def collect_stock_training_sample(
 ) -> pd.DataFrame:
     """Collect a deterministic sample of stock panel rows for model training."""
 
-    # Iterate training dates and collect a stable subsample to control memory.
+    # Iterate training dates and collect a stable hash-based subsample.
     pieces: list[pd.DataFrame] = []
-    rows_collected = 0
     for date in dates:
-        # Stop once enough rows are collected for training.
-        if int(rows_collected) >= int(max_rows):
-            break
-
         # Load cached day panel and keep train split only.
         day = load_or_build_stock_panel_day(
             date=int(date),
@@ -247,12 +254,12 @@ def collect_stock_training_sample(
             "MinuteIndex"
         ].astype(np.int64)
         mask = (key % int(sample_mod)).astype(int) == 0
-        sampled = day.loc[mask, ["date", "label_stock_10m"] + feature_cols].copy()
+        sampled = day.loc[mask, ["date", "stock_code", "MinuteIndex", "label_stock_10m"] + feature_cols].copy()
         pieces.append(sampled)
-        rows_collected += int(len(sampled))
 
     # Concatenate samples into a single training frame.
     sample = pd.concat(pieces, axis=0, ignore_index=True)
+    assert int(len(sample)) <= int(max_rows)
     return sample
 
 
@@ -338,15 +345,14 @@ def main() -> None:
     train_start = 20210101
     train_end = 20231231
     test_start = 20240201
-    max_train_days = 260
-    max_test_days = 80
+    test_end = 20251231
 
     # Define data locations.
     repo_root = os.path.dirname(os.path.abspath(__file__))
-    weight_path = os.path.join(repo_root, "data/ashare/market/index_weight/000905.feather")
+    weight_path = "/data/ashare/market/index_weight/000905.feather"
     etf1m_root = "/data/ashare/market/etf1m"
     stock1m_root = "/data/ashare/market/stock1m"
-    stock_panel_cache_root = "/data-cache/index500-predict/stock_panel_days_v1"
+    stock_panel_cache_root = "/data-cache/index500-predict/stock_panel_days_v2"
     # Create output run directory under repo report folder.
     run_id = dt.datetime.now().strftime("run_%Y%m%d_%H%M%S")
     report_dir = os.path.join(repo_root, "report", run_id)
@@ -357,14 +363,8 @@ def main() -> None:
 
     # Discover available dates and keep only those needed for train/test.
     all_dates = list_available_dates_from_etf1m_dir(etf1m_dir=etf1m_root)
-    train_dates, test_dates = choose_train_test_dates(
-        all_dates=all_dates,
-        train_start=train_start,
-        train_end=train_end,
-        test_start=test_start,
-        max_train_days=max_train_days,
-        max_test_days=max_test_days,
-    )
+    train_dates = filter_dates_by_range(all_dates=all_dates, start_date=train_start, end_date=train_end)
+    test_dates = filter_dates_by_range(all_dates=all_dates, start_date=test_start, end_date=test_end)
     dates_needed = list(train_dates) + list(test_dates)
     print(f"[INFO] Available dates={len(all_dates)}, using train_dates={len(train_dates)}, test_dates={len(test_dates)}.")
 
@@ -374,10 +374,10 @@ def main() -> None:
         f"[INFO] Loaded weights rows={len(weights)}. trade_date_min={weights['trade_date'].min()} trade_date_max={weights['trade_date'].max()}."
     )
 
-    # Stage 1: Build stock panel parquet (primary deliverable).
+    # Stage 1: Build stock panel parquet (test split deliverable).
     stock_panel_path = os.path.join(report_dir, "stock_panel.parquet")
     stock_panel_meta = write_stock_panel_parquet(
-        dates=dates_needed,
+        dates=list(test_dates),
         weights=weights,
         stock1m_root=stock1m_root,
         horizon_minutes=label_horizon_minutes,
@@ -396,7 +396,7 @@ def main() -> None:
         cache_root=stock_panel_cache_root,
         feature_cols=stock_feature_cols,
         max_rows=2_000_000,
-        sample_mod=20,
+        sample_mod=50,
     )
     train_sample = train_sample.rename(columns={"label_stock_10m": "label"})
     train_sample["month"] = (train_sample["date"].astype(int) // 100).astype(int)
@@ -405,13 +405,39 @@ def main() -> None:
     train_fit = train_sample.loc[train_sample["month"] < val_month].copy()
     print(f"[INFO] Stock train_fit rows={len(train_fit)}, val rows={len(val)} (sampled).")
 
-    # Stage 2: Train the required Linear + XGB unified panel models.
-    stock_linear_features = ["ret_1m", "ret_5m", "ret_10m", "ret_30m", "ret_1m_rel_basket", "rank_ret_1m", "weight"]
-    stock_linear_model = fit_linear_baseline(train=train_fit, features=stock_linear_features)
+    # Stage 2: Train the required Linear (Ridge/Lasso) + XGB + LightGBM unified panel models.
+    stock_linear_features = list(stock_feature_cols)
+    stock_ridge_alpha = 1.0
+    stock_lasso_alpha = 1e-4
+    stock_ridge_bundle = fit_ridge_regression(train=train_fit, features=stock_linear_features, alpha=stock_ridge_alpha)
+    stock_lasso_bundle = fit_lasso_regression(train=train_fit, features=stock_linear_features, alpha=stock_lasso_alpha)
     stock_xgb_model = fit_xgb_model(train=train_fit, val=val, features=stock_feature_cols, seed=seed)
+    stock_lgbm_model = fit_lgbm_model(train=train_fit, val=val, features=stock_feature_cols, seed=seed)
+
+    # Stage 2: Export stock-model feature importance artifacts for the report.
+    stock_xgb_importance = [
+        {"feature": str(f), "importance": float(w)} for f, w in zip(stock_feature_cols, stock_xgb_model.feature_importances_)
+    ]
+    stock_lgbm_importance = [
+        {"feature": str(f), "importance": float(w)} for f, w in zip(stock_feature_cols, stock_lgbm_model.feature_importances_)
+    ]
+    plot_feature_importance(
+        importances=stock_xgb_importance,
+        out_path=os.path.join(report_dir, "fig_stock_xgb_feature_importance.png"),
+        top_k=30,
+        title="Stock XGB Feature Importance",
+    )
+    plot_feature_importance(
+        importances=stock_lgbm_importance,
+        out_path=os.path.join(report_dir, "fig_stock_lgbm_feature_importance.png"),
+        top_k=30,
+        title="Stock LightGBM Feature Importance",
+    )
 
     # Stage 2: Generate stock metrics (test) and basket predictions (train+test).
-    minute_ic_tables: list[pd.DataFrame] = []
+    minute_ic_tables: dict[str, list[pd.DataFrame]] = {k: [] for k in ["xgb", "lgbm", "ridge", "lasso"]}
+    stock_ts_stats_tables: list[pd.DataFrame] = []
+    stock_daily_ic_tables: list[pd.DataFrame] = []
     basket_rows: list[pd.DataFrame] = []
     for date in dates_needed:
         # Load cached day panel and keep train/test rows only.
@@ -427,34 +453,124 @@ def main() -> None:
 
         # Predict stock returns with the panel XGB model.
         xgb_pred = stock_xgb_model.predict(day[stock_feature_cols].to_numpy())
+        lgbm_pred = stock_lgbm_model.predict(day[stock_feature_cols].to_numpy())
 
-        # Predict stock returns with the panel Linear model on its feature subset.
-        lin_pred = np.full(shape=(len(day),), fill_value=np.nan, dtype=float)
-        lin_mask = day[stock_linear_features].notna().all(axis=1).to_numpy()
-        lin_pred[lin_mask] = stock_linear_model.predict(day.loc[lin_mask, stock_linear_features].to_numpy())
+        # Predict stock returns with the Ridge/Lasso linear baselines.
+        ridge_pred = predict_linear_model(bundle=stock_ridge_bundle, frame=day)
+        lasso_pred = predict_linear_model(bundle=stock_lasso_bundle, frame=day)
 
         # Compute stock-level panel IC tables for the test split only.
         if str(day["split"].iloc[0]) == "test":
-            minute_ic_tables.append(compute_panel_ic_by_minute(day_panel=day, pred=xgb_pred, label_col="label_stock_10m"))
+            minute_ic_tables["xgb"].append(compute_panel_ic_by_minute(day_panel=day, pred=xgb_pred, label_col="label_stock_10m"))
+            minute_ic_tables["lgbm"].append(compute_panel_ic_by_minute(day_panel=day, pred=lgbm_pred, label_col="label_stock_10m"))
+            minute_ic_tables["ridge"].append(compute_panel_ic_by_minute(day_panel=day, pred=ridge_pred, label_col="label_stock_10m"))
+            minute_ic_tables["lasso"].append(compute_panel_ic_by_minute(day_panel=day, pred=lasso_pred, label_col="label_stock_10m"))
+            stock_ts_stats_tables.append(compute_stock_sufficient_stats(day_panel=day, pred=xgb_pred, label_col="label_stock_10m"))
+
+            # Compute per-stock within-day IC for robustness diagnostics.
+            stock_daily_ic_tables.append(compute_stock_daily_ic_table(day_panel=day, pred=xgb_pred, label_col="label_stock_10m"))
 
         # Aggregate stock predictions into basket-level minute predictions.
         basket_xgb = aggregate_day_to_basket(stock_day=day, pred=xgb_pred, pred_col_name="pred_stock_xgb")
         basket_xgb["model_name"] = "basket_stock_xgb"
-        basket_lin = aggregate_day_to_basket(stock_day=day, pred=lin_pred, pred_col_name="pred_stock_linear")
-        basket_lin["model_name"] = "basket_stock_linear"
-        basket_rows.append(pd.concat([basket_xgb, basket_lin], axis=0, ignore_index=True))
+        basket_lgbm = aggregate_day_to_basket(stock_day=day, pred=lgbm_pred, pred_col_name="pred_stock_lgbm")
+        basket_lgbm["model_name"] = "basket_stock_lgbm"
+        basket_ridge = aggregate_day_to_basket(stock_day=day, pred=ridge_pred, pred_col_name="pred_stock_ridge")
+        basket_ridge["model_name"] = "basket_stock_ridge"
+        basket_lasso = aggregate_day_to_basket(stock_day=day, pred=lasso_pred, pred_col_name="pred_stock_lasso")
+        basket_lasso["model_name"] = "basket_stock_lasso"
+        basket_rows.append(pd.concat([basket_xgb, basket_lgbm, basket_ridge, basket_lasso], axis=0, ignore_index=True))
 
     # Stage 3: Evaluate Stock Alpha and write basket_pred.parquet (deliverable).
-    minute_ic = pd.concat(minute_ic_tables, axis=0, ignore_index=True)
-    daily_ic = summarize_panel_ic_daily(minute_ic=minute_ic)
-    bucket_ic = summarize_panel_ic_by_minute_bucket(minute_ic=minute_ic, bucket_size=30)
+    stock_alpha_overall: dict[str, dict] = {}
+    for model_name in ["xgb", "lgbm", "ridge", "lasso"]:
+        # Summarize pooled minute IC and daily IC for each stock model.
+        minute_ic = pd.concat(minute_ic_tables[model_name], axis=0, ignore_index=True)
+        daily_ic = summarize_panel_ic_daily(minute_ic=minute_ic)
+        daily_ic_mean = float(daily_ic["ic_mean"].mean())
+        daily_rank_ic_mean = float(daily_ic["rank_ic_mean"].mean())
+        daily_ic_std = float(daily_ic["ic_mean"].std())
+        daily_rank_ic_std = float(daily_ic["rank_ic_mean"].std())
+        stock_alpha_overall[str(model_name)] = {
+            "panel_ic_test_mean": float(minute_ic["ic"].mean()),
+            "panel_rank_ic_test_mean": float(minute_ic["rank_ic"].mean()),
+            "daily_ic_test_mean": daily_ic_mean,
+            "daily_rank_ic_test_mean": daily_rank_ic_mean,
+            "daily_ic_test_std": daily_ic_std,
+            "daily_rank_ic_test_std": daily_rank_ic_std,
+            "daily_icir_test": float(daily_ic_mean / daily_ic_std),
+            "daily_rank_icir_test": float(daily_rank_ic_mean / daily_rank_ic_std),
+        }
+    minute_ic_xgb = pd.concat(minute_ic_tables["xgb"], axis=0, ignore_index=True)
+    bucket_ic = summarize_panel_ic_by_minute_bucket(minute_ic=minute_ic_xgb, bucket_size=30)
     bucket_ic["minute_bucket"] = bucket_ic["minute_bucket"].astype(int)
     stock_alpha_metrics = {
-        "panel_ic_test_mean": float(minute_ic["ic"].mean()),
-        "panel_rank_ic_test_mean": float(minute_ic["rank_ic"].mean()),
-        "daily_ic_test_mean": float(daily_ic["ic_mean"].mean()),
-        "daily_rank_ic_test_mean": float(daily_ic["rank_ic_mean"].mean()),
+        "panel_ic_test_mean": float(stock_alpha_overall["xgb"]["panel_ic_test_mean"]),
+        "panel_rank_ic_test_mean": float(stock_alpha_overall["xgb"]["panel_rank_ic_test_mean"]),
+        "daily_ic_test_mean": float(stock_alpha_overall["xgb"]["daily_ic_test_mean"]),
+        "daily_rank_ic_test_mean": float(stock_alpha_overall["xgb"]["daily_rank_ic_test_mean"]),
+        "overall": stock_alpha_overall,
         "minute_bucket_ic_test": bucket_ic.to_dict(orient="records"),
+        "feature_importance": {
+            "xgb": stock_xgb_importance,
+            "lgbm": stock_lgbm_importance,
+            "fig_stock_xgb_feature_importance": "fig_stock_xgb_feature_importance.png",
+            "fig_stock_lgbm_feature_importance": "fig_stock_lgbm_feature_importance.png",
+        },
+    }
+    # Compute per-stock time-series metrics on the test split for stock-level diagnostics.
+    stock_ts_stats = pd.concat(stock_ts_stats_tables, axis=0, ignore_index=True)
+    stock_ts_stats_sum = stock_ts_stats.groupby("stock_code", sort=True).sum(numeric_only=True).reset_index()
+    stock_ts_metrics = finalize_stock_metrics_from_sufficient_stats(stats=stock_ts_stats_sum)
+
+    # Compute per-stock within-day IC averages as a robustness cross-check.
+    stock_daily_ic = pd.concat(stock_daily_ic_tables, axis=0, ignore_index=True)
+    stock_daily_summary = (
+        stock_daily_ic.groupby("stock_code", sort=True)
+        .agg(
+            daily_ic_mean=("daily_ic", "mean"),
+            daily_rank_ic_mean=("daily_rank_ic", "mean"),
+            days=("daily_ic", "size"),
+            daily_n_sum=("n", "sum"),
+            daily_ic_neg_rate=("daily_ic", lambda s: float(np.mean(s.to_numpy(dtype=float) < 0.0))),
+        )
+        .reset_index()
+    )
+
+    # Merge minute-level and within-day summary tables to one per-stock evaluation table.
+    stock_metrics = stock_ts_metrics.merge(stock_daily_summary, on="stock_code", how="left")
+
+    # Tag stocks as good/bad/neutral using an IC t-stat threshold.
+    ic_t_threshold = 2.0
+    ic_abs_threshold = 0.05
+    stock_metrics["verdict"] = "neutral"
+    stock_metrics.loc[(stock_metrics["ic"] >= ic_abs_threshold) & (stock_metrics["ic_t"] >= ic_t_threshold), "verdict"] = "good"
+    stock_metrics.loc[(stock_metrics["ic"] <= -ic_abs_threshold) & (stock_metrics["ic_t"] <= -ic_t_threshold), "verdict"] = "bad"
+
+    # Write the per-stock table as a parquet artifact for detailed inspection.
+    stock_metrics_path = os.path.join(report_dir, "stock_metrics_test.parquet")
+    stock_metrics.to_parquet(stock_metrics_path, index=False)
+
+    # Add a compact per-stock summary into metrics.yaml for the markdown report.
+    ic_vals = stock_metrics["ic"].to_numpy(dtype=float)
+    ic_vals = ic_vals[np.isfinite(ic_vals)]
+    q05, q50, q95 = np.quantile(ic_vals, [0.05, 0.50, 0.95]) if len(ic_vals) else [float("nan")] * 3
+    verdict_counts = stock_metrics["verdict"].value_counts(dropna=False).to_dict()
+    stock_alpha_metrics["per_stock_test"] = {
+        "ic_t_threshold": float(ic_t_threshold),
+        "ic_abs_threshold": float(ic_abs_threshold),
+        "n_stocks": int(len(stock_metrics)),
+        "verdict_counts": {str(k): int(v) for k, v in verdict_counts.items()},
+        "ic_quantiles": {"q05": float(q05), "q50": float(q50), "q95": float(q95)},
+        "top_ic": stock_metrics.sort_values("ic", ascending=False)
+        .head(10)
+        .loc[:, ["stock_code", "weight_mean", "ic", "ic_t", "direction_acc", "rmse", "mae"]]
+        .to_dict(orient="records"),
+        "bottom_ic": stock_metrics.sort_values("ic", ascending=True)
+        .head(10)
+        .loc[:, ["stock_code", "weight_mean", "ic", "ic_t", "direction_acc", "rmse", "mae"]]
+        .to_dict(orient="records"),
+        "artifact_stock_metrics_test": "stock_metrics_test.parquet",
     }
 
     basket_all = pd.concat(basket_rows, axis=0, ignore_index=True)
@@ -473,11 +589,126 @@ def main() -> None:
         etf_code_int=etf_code_int,
         horizon_minutes=label_horizon_minutes,
     )
-    basket_xgb = basket_all.loc[basket_all["model_name"] == "basket_stock_xgb", ["date", "datetime", "basket_pred"]].copy()
-    basket_lin = basket_all.loc[
-        basket_all["model_name"] == "basket_stock_linear",
-        ["date", "datetime", "basket_pred"],
-    ].copy()
+
+    # Stage 4: Evaluate basket predictions against the real ETF label (Basis evaluation).
+    basis_pred_tables: list[pd.DataFrame] = []
+    basis_join_rows: list[pd.DataFrame] = []
+    for model_name, part in basket_all.groupby("model_name", sort=True):
+        # Join basket_pred to the ETF dataset for a like-for-like evaluation table.
+        basket_pred = part.loc[:, ["date", "datetime", "split", "basket_pred"]].copy()
+        joined = etf_dataset.merge(basket_pred, on=["date", "datetime", "split"], how="inner")
+
+        # Append a standardized prediction table for compute_metrics.
+        basis_pred_tables.append(
+            make_etf_prediction_table(
+                frame=joined,
+                model_name=f"basis_{str(model_name)}",
+                pred=joined["basket_pred"].to_numpy(dtype=float),
+                label_col="label_etf_10m",
+            )
+        )
+
+        # Append a compact per-minute basis table for research inspection.
+        out = joined.loc[:, ["date", "datetime", "split", "MinuteIndex", "basket_pred", "label_etf_10m"]].copy()
+        out["basis"] = out["basket_pred"].astype(float) - out["label_etf_10m"].astype(float)
+        out["model_name"] = str(model_name)
+        basis_join_rows.append(out)
+
+    basis_pred_table = pd.concat(basis_pred_tables, axis=0, ignore_index=True)
+    basis_metrics = compute_metrics(pred_table=basis_pred_table)
+    basis_pred_path = os.path.join(report_dir, "basis_pred_vs_etf.parquet")
+    pd.concat(basis_join_rows, axis=0, ignore_index=True).to_parquet(basis_pred_path, index=False)
+
+    # Stage 4: Pick the best basket branch by test IC and plot its daily IC time series.
+    best_basis_model = pick_best_model_by_metric(etf_overall=basis_metrics["overall"], split="test", metric_name="ic")
+    best_basis_daily = pd.DataFrame(basis_metrics["rolling"][best_basis_model]).copy()
+    plot_daily_timeseries(
+        daily=best_basis_daily,
+        value_col="ic",
+        roll_20_col="ic_roll_20",
+        roll_60_col="ic_roll_60",
+        title=f"Basis IC (Basket pred vs ETF, {best_basis_model}, test)",
+        out_path=os.path.join(report_dir, "fig_basis_best_daily_ic.png"),
+    )
+    # Compare synthetic basket realized returns to the real ETF realized returns.
+    basket_realized = (
+        basket_all.groupby(["date", "datetime", "split"], sort=True)
+        .agg(
+            basket_label=("basket_label", "mean"),
+            weight_coverage_pred=("weight_coverage_pred", "mean"),
+        )
+        .reset_index()
+    )
+    synthetic_join = etf_dataset.merge(basket_realized, on=["date", "datetime", "split"], how="inner")
+
+    # Compute synthetic-vs-real error summaries for both splits.
+    synthetic_vs_real: dict = {}
+    for split_name in ["train", "test"]:
+        # Build split arrays for stable summary metrics.
+        part = synthetic_join.loc[synthetic_join["split"] == split_name].copy()
+        pred = part["basket_label"].to_numpy(dtype=float)
+        label = part["label_etf_10m"].to_numpy(dtype=float)
+        summary = compute_error_summary(pred=pred, label=label)
+        summary["ols"] = compute_ols_summary(x=pred, y=label)
+        synthetic_vs_real[str(split_name)] = summary
+
+    # Compute minute-bucket error diagnostics on the test split only.
+    synthetic_test = synthetic_join.loc[synthetic_join["split"] == "test"].copy()
+    synthetic_bucket = summarize_error_by_minute_bucket(
+        frame=synthetic_test,
+        pred_col="basket_label",
+        label_col="label_etf_10m",
+        minute_col="MinuteIndex",
+        bucket_size=30,
+    )
+
+    # Write a detailed synthetic-vs-real join parquet for the research report.
+    synthetic_join_path = os.path.join(report_dir, "synthetic_vs_real_etf.parquet")
+    synthetic_out = synthetic_join.loc[:, ["date", "datetime", "split", "MinuteIndex", "basket_label", "label_etf_10m", "weight_coverage_pred"]].copy()
+    synthetic_out["delta"] = synthetic_out["basket_label"].astype(float) - synthetic_out["label_etf_10m"].astype(float)
+    synthetic_out.to_parquet(synthetic_join_path, index=False)
+
+    # Plot synthetic vs real scatter and error distribution on test.
+    synthetic_pred_table = make_etf_prediction_table(
+        frame=synthetic_test,
+        model_name="synthetic_basket_label_vs_etf",
+        pred=synthetic_test["basket_label"].to_numpy(dtype=float),
+        label_col="label_etf_10m",
+    )
+    plot_prediction_scatter(
+        pred_table=synthetic_pred_table,
+        model_name="synthetic_basket_label_vs_etf",
+        out_path=os.path.join(report_dir, "fig_synth_vs_real_scatter_test.png"),
+    )
+    plot_histogram(
+        values=(synthetic_test["basket_label"].to_numpy(dtype=float) - synthetic_test["label_etf_10m"].to_numpy(dtype=float)),
+        bins=80,
+        title="Synthetic minus Real ETF (10m return, test)",
+        out_path=os.path.join(report_dir, "fig_synth_vs_real_error_hist_test.png"),
+    )
+    daily_delta = (
+        synthetic_out.loc[synthetic_out["split"] == "test"]
+        .groupby("date", sort=True)
+        .agg(delta_mean=("delta", "mean"))
+        .reset_index()
+        .sort_values("date", ascending=True)
+    )
+    daily_delta["delta_roll_20"] = daily_delta["delta_mean"].rolling(window=20, min_periods=20).mean()
+    daily_delta["delta_roll_60"] = daily_delta["delta_mean"].rolling(window=60, min_periods=60).mean()
+    plot_daily_timeseries(
+        daily=daily_delta,
+        value_col="delta_mean",
+        roll_20_col="delta_roll_20",
+        roll_60_col="delta_roll_60",
+        title="Synthetic - Real ETF (Daily mean error, test)",
+        out_path=os.path.join(report_dir, "fig_synth_vs_real_daily_delta_test.png"),
+    )
+    basket_branches = {
+        "basket_stock_xgb": basket_all.loc[basket_all["model_name"] == "basket_stock_xgb", ["date", "datetime", "split", "basket_pred"]].copy(),
+        "basket_stock_lgbm": basket_all.loc[basket_all["model_name"] == "basket_stock_lgbm", ["date", "datetime", "split", "basket_pred"]].copy(),
+        "basket_stock_ridge": basket_all.loc[basket_all["model_name"] == "basket_stock_ridge", ["date", "datetime", "split", "basket_pred"]].copy(),
+        "basket_stock_lasso": basket_all.loc[basket_all["model_name"] == "basket_stock_lasso", ["date", "datetime", "split", "basket_pred"]].copy(),
+    }
 
     # Stage 4: Define basis feature set shared by all branches.
     basis_features = [
@@ -496,33 +727,22 @@ def main() -> None:
         "basket_pred",
     ]
 
-    # Stage 4: Build raw ETF prediction tables for both basket branches.
+    # Stage 4: Build raw + basis-corrected ETF prediction tables for all basket branches.
     etf_pred_tables: list[pd.DataFrame] = []
-    raw_join_xgb = etf_dataset.merge(basket_xgb, on=["date", "datetime"], how="inner")
-    raw_join_lin = etf_dataset.merge(basket_lin, on=["date", "datetime"], how="inner")
-    etf_pred_tables.append(
-        make_etf_prediction_table(
-            frame=raw_join_xgb,
-            model_name="raw_basket_stock_xgb_vs_etf",
-            pred=raw_join_xgb["basket_pred"].to_numpy(dtype=float),
-            label_col="label_etf_10m",
-        )
-    )
-    etf_pred_tables.append(
-        make_etf_prediction_table(
-            frame=raw_join_lin,
-            model_name="raw_basket_stock_linear_vs_etf",
-            pred=raw_join_lin["basket_pred"].to_numpy(dtype=float),
-            label_col="label_etf_10m",
-        )
-    )
-
-    # Stage 4: Fit basis_linear per branch and synthesize corrected ETF predictions.
     basis_pairs: list[tuple[str, str]] = []
-    for raw_model_name, joined in [
-        ("raw_basket_stock_xgb_vs_etf", raw_join_xgb),
-        ("raw_basket_stock_linear_vs_etf", raw_join_lin),
-    ]:
+    for branch_name, basket_pred in basket_branches.items():
+        # Build the raw join table for this basket branch.
+        joined = etf_dataset.merge(basket_pred, on=["date", "datetime", "split"], how="inner")
+        raw_model_name = f"raw_{branch_name}_vs_etf"
+        etf_pred_tables.append(
+            make_etf_prediction_table(
+                frame=joined,
+                model_name=raw_model_name,
+                pred=joined["basket_pred"].to_numpy(dtype=float),
+                label_col="label_etf_10m",
+            )
+        )
+
         # Build residual label and clean infinities for linear regression stability.
         joined = joined.copy()
         joined["basis_realized"] = joined["label_etf_10m"] - joined["basket_pred"]
@@ -538,11 +758,8 @@ def main() -> None:
         basis_pred[basis_mask] = basis_model.predict(joined.loc[basis_mask, basis_features].to_numpy())
         bottom_up_pred = joined["basket_pred"].to_numpy(dtype=float) + basis_pred
 
-        # Map raw model name to the required plus-basis naming in AGENTS.md.
-        if str(raw_model_name) == "raw_basket_stock_xgb_vs_etf":
-            basis_model_name = "basket_stock_xgb_plus_basis"
-        else:
-            basis_model_name = "basket_stock_linear_plus_basis"
+        # Record the raw->basis pair for delta plots and reporting.
+        basis_model_name = f"{branch_name}_plus_basis"
         basis_pairs.append((str(raw_model_name), str(basis_model_name)))
 
         # Append basis-corrected ETF prediction table.
@@ -590,6 +807,34 @@ def main() -> None:
     etf_pred_table.to_parquet(etf_pred_path, index=False)
     etf_metrics = compute_metrics(pred_table=etf_pred_table)
 
+    # Stage 5: Build a basis-corrected evaluation table for basket branches only.
+    basis_corrected_models = [f"{name}_plus_basis" for name in basket_branches.keys()]
+    basis_corrected_overall: dict[str, dict] = {}
+    for model_name in basis_corrected_models:
+        # Copy overall metrics and enrich with ICIR computed from daily IC series.
+        row = {k: dict(v) for k, v in etf_metrics["overall"][model_name].items()}
+        daily = pd.DataFrame(etf_metrics["daily"][model_name]).copy()
+        ic_mean = float(daily["ic"].mean())
+        ic_std = float(daily["ic"].std())
+        rank_ic_mean = float(daily["rank_ic"].mean())
+        rank_ic_std = float(daily["rank_ic"].std())
+        row["test"]["icir"] = float(ic_mean / ic_std)
+        row["test"]["rank_icir"] = float(rank_ic_mean / rank_ic_std)
+        basis_corrected_overall[str(model_name)] = row
+    scored_basis = [(name, float(basis_corrected_overall[name]["test"]["ic"])) for name in basis_corrected_models]
+    scored_basis_sorted = sorted(scored_basis, key=lambda x: (np.nan_to_num(x[1], nan=-1e9)), reverse=True)
+    best_basis_corrected_model = str(scored_basis_sorted[0][0])
+    best_basis_corrected_row = etf_metrics["overall"][best_basis_corrected_model]["test"]
+    best_basis_corrected_daily = pd.DataFrame(etf_metrics["rolling"][best_basis_corrected_model]).copy()
+    plot_daily_timeseries(
+        daily=best_basis_corrected_daily,
+        value_col="ic",
+        roll_20_col="ic_roll_20",
+        roll_60_col="ic_roll_60",
+        title=f"Basis-corrected IC ({best_basis_corrected_model}, test)",
+        out_path=os.path.join(report_dir, "fig_basis_corrected_best_daily_ic.png"),
+    )
+
     # Stage 5: Choose the best model by ETF test RankIC (selection rule in AGENTS.md).
     best_model = pick_best_model_by_metric(etf_overall=etf_metrics["overall"], split="test", metric_name="rank_ic")
     best_row = etf_metrics["overall"][best_model]["test"]
@@ -603,13 +848,49 @@ def main() -> None:
             "label_horizon_minutes": int(label_horizon_minutes),
             "train_range": [int(train_start), int(train_end)],
             "test_start": int(test_start),
+            "test_end": int(test_end),
             "used_train_days": int(len(train_dates)),
             "used_test_days": int(len(test_dates)),
         },
         "stock_alpha": stock_alpha_metrics,
+        "basis_eval": {
+            "overall": basis_corrected_overall,
+            "raw_overall": basis_metrics["overall"],
+            "selection": {
+                "selection_key": "test_ic",
+                "selected_model": str(best_basis_corrected_model),
+                "selected_test_ic": float(best_basis_corrected_row["ic"]),
+                "selected_test_rank_ic": float(best_basis_corrected_row["rank_ic"]),
+                "selected_test_rmse": float(best_basis_corrected_row["rmse"]),
+                "selected_test_mae": float(best_basis_corrected_row["mae"]),
+            },
+            "artifacts": {
+                "basis_pred_vs_etf_parquet": "basis_pred_vs_etf.parquet",
+                "fig_basis_best_daily_ic": "fig_basis_best_daily_ic.png",
+                "fig_basis_corrected_best_daily_ic": "fig_basis_corrected_best_daily_ic.png",
+            },
+        },
+        "synthetic_vs_real_etf": {
+            "overall": synthetic_vs_real,
+            "minute_bucket_test": synthetic_bucket.to_dict(orient="records"),
+            "artifacts": {
+                "synthetic_vs_real_etf_parquet": "synthetic_vs_real_etf.parquet",
+                "fig_synth_vs_real_scatter_test": "fig_synth_vs_real_scatter_test.png",
+                "fig_synth_vs_real_error_hist_test": "fig_synth_vs_real_error_hist_test.png",
+                "fig_synth_vs_real_daily_delta_test": "fig_synth_vs_real_daily_delta_test.png",
+            },
+        },
         "basket_synthesis": {"overall": basket_metrics["overall"]},
         "etf_level": {"overall": etf_metrics["overall"], "raw_vs_basis_delta_test": raw_vs_basis_delta_test},
         "selection": {
+            "selection_key": "test_ic",
+            "selected_model": str(best_basis_corrected_model),
+            "selected_test_ic": float(best_basis_corrected_row["ic"]),
+            "selected_test_rank_ic": float(best_basis_corrected_row["rank_ic"]),
+            "selected_test_rmse": float(best_basis_corrected_row["rmse"]),
+            "selected_test_mae": float(best_basis_corrected_row["mae"]),
+        },
+        "selection_etf": {
             "selection_key": "test_rank_ic",
             "selected_model": str(best_model),
             "selected_test_ic": float(best_row["ic"]),
