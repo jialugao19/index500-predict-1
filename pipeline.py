@@ -7,10 +7,20 @@ import time
 import numpy as np
 import pandas as pd
 
-from eval.metrics import compute_metrics
+from eval.metrics import (
+    compute_error_summary,
+    compute_metrics,
+    compute_ols_summary,
+    safe_corr,
+    safe_spearman,
+    summarize_error_by_minute_bucket,
+)
 from eval.feature_importance import compute_feature_ic_table
 from eval.stock_level import (
+    compute_stock_sufficient_stats,
+    compute_stock_daily_ic_table,
     compute_panel_ic_by_minute,
+    finalize_stock_metrics_from_sufficient_stats,
     summarize_panel_ic_by_minute_bucket,
     summarize_panel_ic_daily,
 )
@@ -27,6 +37,7 @@ from eval.plots import (
     plot_monthly_timeseries,
     plot_prediction_scatter,
     plot_prediction_timeseries,
+    plot_histogram,
     plot_raw_vs_basis_delta,
 )
 from eval.writers import (
@@ -412,6 +423,8 @@ def main() -> None:
 
     # Stage 2: Generate stock metrics (test) and basket predictions (train+test).
     minute_ic_tables: list[pd.DataFrame] = []
+    stock_ts_stats_tables: list[pd.DataFrame] = []
+    stock_daily_ic_tables: list[pd.DataFrame] = []
     basket_rows: list[pd.DataFrame] = []
     for date in dates_needed:
         # Load cached day panel and keep train/test rows only.
@@ -436,6 +449,10 @@ def main() -> None:
         # Compute stock-level panel IC tables for the test split only.
         if str(day["split"].iloc[0]) == "test":
             minute_ic_tables.append(compute_panel_ic_by_minute(day_panel=day, pred=xgb_pred, label_col="label_stock_10m"))
+            stock_ts_stats_tables.append(compute_stock_sufficient_stats(day_panel=day, pred=xgb_pred, label_col="label_stock_10m"))
+
+            # Compute per-stock within-day IC for robustness diagnostics.
+            stock_daily_ic_tables.append(compute_stock_daily_ic_table(day_panel=day, pred=xgb_pred, label_col="label_stock_10m"))
 
         # Aggregate stock predictions into basket-level minute predictions.
         basket_xgb = aggregate_day_to_basket(stock_day=day, pred=xgb_pred, pred_col_name="pred_stock_xgb")
@@ -456,6 +473,60 @@ def main() -> None:
         "daily_rank_ic_test_mean": float(daily_ic["rank_ic_mean"].mean()),
         "minute_bucket_ic_test": bucket_ic.to_dict(orient="records"),
     }
+    # Compute per-stock time-series metrics on the test split for stock-level diagnostics.
+    stock_ts_stats = pd.concat(stock_ts_stats_tables, axis=0, ignore_index=True)
+    stock_ts_stats_sum = stock_ts_stats.groupby("stock_code", sort=True).sum(numeric_only=True).reset_index()
+    stock_ts_metrics = finalize_stock_metrics_from_sufficient_stats(stats=stock_ts_stats_sum)
+
+    # Compute per-stock within-day IC averages as a robustness cross-check.
+    stock_daily_ic = pd.concat(stock_daily_ic_tables, axis=0, ignore_index=True)
+    stock_daily_summary = (
+        stock_daily_ic.groupby("stock_code", sort=True)
+        .agg(
+            daily_ic_mean=("daily_ic", "mean"),
+            daily_rank_ic_mean=("daily_rank_ic", "mean"),
+            days=("daily_ic", "size"),
+            daily_n_sum=("n", "sum"),
+            daily_ic_neg_rate=("daily_ic", lambda s: float(np.mean(s.to_numpy(dtype=float) < 0.0))),
+        )
+        .reset_index()
+    )
+
+    # Merge minute-level and within-day summary tables to one per-stock evaluation table.
+    stock_metrics = stock_ts_metrics.merge(stock_daily_summary, on="stock_code", how="left")
+
+    # Tag stocks as good/bad/neutral using an IC t-stat threshold.
+    ic_t_threshold = 2.0
+    ic_abs_threshold = 0.05
+    stock_metrics["verdict"] = "neutral"
+    stock_metrics.loc[(stock_metrics["ic"] >= ic_abs_threshold) & (stock_metrics["ic_t"] >= ic_t_threshold), "verdict"] = "good"
+    stock_metrics.loc[(stock_metrics["ic"] <= -ic_abs_threshold) & (stock_metrics["ic_t"] <= -ic_t_threshold), "verdict"] = "bad"
+
+    # Write the per-stock table as a parquet artifact for detailed inspection.
+    stock_metrics_path = os.path.join(report_dir, "stock_metrics_test.parquet")
+    stock_metrics.to_parquet(stock_metrics_path, index=False)
+
+    # Add a compact per-stock summary into metrics.yaml for the markdown report.
+    ic_vals = stock_metrics["ic"].to_numpy(dtype=float)
+    ic_vals = ic_vals[np.isfinite(ic_vals)]
+    q05, q50, q95 = np.quantile(ic_vals, [0.05, 0.50, 0.95]) if len(ic_vals) else [float("nan")] * 3
+    verdict_counts = stock_metrics["verdict"].value_counts(dropna=False).to_dict()
+    stock_alpha_metrics["per_stock_test"] = {
+        "ic_t_threshold": float(ic_t_threshold),
+        "ic_abs_threshold": float(ic_abs_threshold),
+        "n_stocks": int(len(stock_metrics)),
+        "verdict_counts": {str(k): int(v) for k, v in verdict_counts.items()},
+        "ic_quantiles": {"q05": float(q05), "q50": float(q50), "q95": float(q95)},
+        "top_ic": stock_metrics.sort_values("ic", ascending=False)
+        .head(10)
+        .loc[:, ["stock_code", "weight_mean", "ic", "ic_t", "direction_acc", "rmse", "mae"]]
+        .to_dict(orient="records"),
+        "bottom_ic": stock_metrics.sort_values("ic", ascending=True)
+        .head(10)
+        .loc[:, ["stock_code", "weight_mean", "ic", "ic_t", "direction_acc", "rmse", "mae"]]
+        .to_dict(orient="records"),
+        "artifact_stock_metrics_test": "stock_metrics_test.parquet",
+    }
 
     basket_all = pd.concat(basket_rows, axis=0, ignore_index=True)
     basket_pred_path = os.path.join(report_dir, "basket_pred.parquet")
@@ -472,6 +543,79 @@ def main() -> None:
         etf1m_root=etf1m_root,
         etf_code_int=etf_code_int,
         horizon_minutes=label_horizon_minutes,
+    )
+    # Compare synthetic basket realized returns to the real ETF realized returns.
+    basket_realized = (
+        basket_all.groupby(["date", "datetime", "split"], sort=True)
+        .agg(
+            basket_label=("basket_label", "mean"),
+            weight_coverage_pred=("weight_coverage_pred", "mean"),
+        )
+        .reset_index()
+    )
+    synthetic_join = etf_dataset.merge(basket_realized, on=["date", "datetime", "split"], how="inner")
+
+    # Compute synthetic-vs-real error summaries for both splits.
+    synthetic_vs_real: dict = {}
+    for split_name in ["train", "test"]:
+        # Build split arrays for stable summary metrics.
+        part = synthetic_join.loc[synthetic_join["split"] == split_name].copy()
+        pred = part["basket_label"].to_numpy(dtype=float)
+        label = part["label_etf_10m"].to_numpy(dtype=float)
+        summary = compute_error_summary(pred=pred, label=label)
+        summary["ols"] = compute_ols_summary(x=pred, y=label)
+        synthetic_vs_real[str(split_name)] = summary
+
+    # Compute minute-bucket error diagnostics on the test split only.
+    synthetic_test = synthetic_join.loc[synthetic_join["split"] == "test"].copy()
+    synthetic_bucket = summarize_error_by_minute_bucket(
+        frame=synthetic_test,
+        pred_col="basket_label",
+        label_col="label_etf_10m",
+        minute_col="MinuteIndex",
+        bucket_size=30,
+    )
+
+    # Write a detailed synthetic-vs-real join parquet for the research report.
+    synthetic_join_path = os.path.join(report_dir, "synthetic_vs_real_etf.parquet")
+    synthetic_out = synthetic_join.loc[:, ["date", "datetime", "split", "MinuteIndex", "basket_label", "label_etf_10m", "weight_coverage_pred"]].copy()
+    synthetic_out["delta"] = synthetic_out["basket_label"].astype(float) - synthetic_out["label_etf_10m"].astype(float)
+    synthetic_out.to_parquet(synthetic_join_path, index=False)
+
+    # Plot synthetic vs real scatter and error distribution on test.
+    synthetic_pred_table = make_etf_prediction_table(
+        frame=synthetic_test,
+        model_name="synthetic_basket_label_vs_etf",
+        pred=synthetic_test["basket_label"].to_numpy(dtype=float),
+        label_col="label_etf_10m",
+    )
+    plot_prediction_scatter(
+        pred_table=synthetic_pred_table,
+        model_name="synthetic_basket_label_vs_etf",
+        out_path=os.path.join(report_dir, "fig_synth_vs_real_scatter_test.png"),
+    )
+    plot_histogram(
+        values=(synthetic_test["basket_label"].to_numpy(dtype=float) - synthetic_test["label_etf_10m"].to_numpy(dtype=float)),
+        bins=80,
+        title="Synthetic minus Real ETF (10m return, test)",
+        out_path=os.path.join(report_dir, "fig_synth_vs_real_error_hist_test.png"),
+    )
+    daily_delta = (
+        synthetic_out.loc[synthetic_out["split"] == "test"]
+        .groupby("date", sort=True)
+        .agg(delta_mean=("delta", "mean"))
+        .reset_index()
+        .sort_values("date", ascending=True)
+    )
+    daily_delta["delta_roll_20"] = daily_delta["delta_mean"].rolling(window=20, min_periods=20).mean()
+    daily_delta["delta_roll_60"] = daily_delta["delta_mean"].rolling(window=60, min_periods=60).mean()
+    plot_daily_timeseries(
+        daily=daily_delta,
+        value_col="delta_mean",
+        roll_20_col="delta_roll_20",
+        roll_60_col="delta_roll_60",
+        title="Synthetic - Real ETF (Daily mean error, test)",
+        out_path=os.path.join(report_dir, "fig_synth_vs_real_daily_delta_test.png"),
     )
     basket_xgb = basket_all.loc[basket_all["model_name"] == "basket_stock_xgb", ["date", "datetime", "basket_pred"]].copy()
     basket_lin = basket_all.loc[
@@ -607,6 +751,16 @@ def main() -> None:
             "used_test_days": int(len(test_dates)),
         },
         "stock_alpha": stock_alpha_metrics,
+        "synthetic_vs_real_etf": {
+            "overall": synthetic_vs_real,
+            "minute_bucket_test": synthetic_bucket.to_dict(orient="records"),
+            "artifacts": {
+                "synthetic_vs_real_etf_parquet": "synthetic_vs_real_etf.parquet",
+                "fig_synth_vs_real_scatter_test": "fig_synth_vs_real_scatter_test.png",
+                "fig_synth_vs_real_error_hist_test": "fig_synth_vs_real_error_hist_test.png",
+                "fig_synth_vs_real_daily_delta_test": "fig_synth_vs_real_daily_delta_test.png",
+            },
+        },
         "basket_synthesis": {"overall": basket_metrics["overall"]},
         "etf_level": {"overall": etf_metrics["overall"], "raw_vs_basis_delta_test": raw_vs_basis_delta_test},
         "selection": {

@@ -189,3 +189,19 @@ def plot_raw_vs_basis_delta(
     plt.tight_layout()
     plt.savefig(out_path)
     plt.close()
+
+
+def plot_histogram(values: np.ndarray, bins: int, title: str, out_path: str) -> None:
+    """Plot a simple histogram for a 1D numeric series."""
+
+    # Keep only finite values for stable histogram rendering.
+    vals = np.asarray(values, dtype=float)
+    vals = vals[np.isfinite(vals)]
+
+    # Draw and save a compact histogram.
+    plt.figure(figsize=(8, 4))
+    plt.hist(vals, bins=int(bins), alpha=0.85)
+    plt.title(title)
+    plt.tight_layout()
+    plt.savefig(out_path)
+    plt.close()
