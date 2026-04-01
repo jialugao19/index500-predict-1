@@ -26,8 +26,6 @@ from eval.stock_level import (
 )
 from eval.walk_forward import run_walk_forward_validation
 from features.etf import compute_etf_features, compute_label_from_close
-from models.baselines import compute_baseline_preds, fit_lasso_regression, fit_ridge_regression, predict_linear_model
-from models.basis import fit_basis_linear_model
 from models.lgbm import fit_lgbm_model
 from models.xgb import fit_xgb_model
 from eval.plots import (
@@ -39,7 +37,6 @@ from eval.plots import (
     plot_prediction_scatter,
     plot_prediction_timeseries,
     plot_histogram,
-    plot_raw_vs_basis_delta,
 )
 from eval.writers import (
     compute_coverage_audit_tables,
@@ -353,9 +350,12 @@ def main() -> None:
     etf1m_root = "/data/ashare/market/etf1m"
     stock1m_root = "/data/ashare/market/stock1m"
     stock_panel_cache_root = "/data-cache/index500-predict/stock_panel_days_v2"
-    # Create output run directory under repo report folder.
-    run_id = dt.datetime.now().strftime("run_%Y%m%d_%H%M%S")
-    report_dir = os.path.join(repo_root, "report", run_id)
+    # Create output run directory under repo report folder grouped by month-day for easy browsing.
+    now = dt.datetime.now()
+    day_tag = now.strftime("%m%d")
+    run_id = now.strftime("run_%Y%m%d_%H%M%S")
+    report_day_dir = os.path.join(repo_root, "report", day_tag)
+    report_dir = os.path.join(report_day_dir, run_id)
     ensure_dir(report_dir)
 
     # Set seeds for reproducibility.
@@ -405,12 +405,7 @@ def main() -> None:
     train_fit = train_sample.loc[train_sample["month"] < val_month].copy()
     print(f"[INFO] Stock train_fit rows={len(train_fit)}, val rows={len(val)} (sampled).")
 
-    # Stage 2: Train the required Linear (Ridge/Lasso) + XGB + LightGBM unified panel models.
-    stock_linear_features = list(stock_feature_cols)
-    stock_ridge_alpha = 1.0
-    stock_lasso_alpha = 1e-4
-    stock_ridge_bundle = fit_ridge_regression(train=train_fit, features=stock_linear_features, alpha=stock_ridge_alpha)
-    stock_lasso_bundle = fit_lasso_regression(train=train_fit, features=stock_linear_features, alpha=stock_lasso_alpha)
+    # Stage 2: Train the required XGBoost + LightGBM unified panel models.
     stock_xgb_model = fit_xgb_model(train=train_fit, val=val, features=stock_feature_cols, seed=seed)
     stock_lgbm_model = fit_lgbm_model(train=train_fit, val=val, features=stock_feature_cols, seed=seed)
 
@@ -435,7 +430,7 @@ def main() -> None:
     )
 
     # Stage 2: Generate stock metrics (test) and basket predictions (train+test).
-    minute_ic_tables: dict[str, list[pd.DataFrame]] = {k: [] for k in ["xgb", "lgbm", "ridge", "lasso"]}
+    minute_ic_tables: dict[str, list[pd.DataFrame]] = {k: [] for k in ["xgb", "lgbm"]}
     stock_ts_stats_tables: list[pd.DataFrame] = []
     stock_daily_ic_tables: list[pd.DataFrame] = []
     basket_rows: list[pd.DataFrame] = []
@@ -455,16 +450,10 @@ def main() -> None:
         xgb_pred = stock_xgb_model.predict(day[stock_feature_cols].to_numpy())
         lgbm_pred = stock_lgbm_model.predict(day[stock_feature_cols].to_numpy())
 
-        # Predict stock returns with the Ridge/Lasso linear baselines.
-        ridge_pred = predict_linear_model(bundle=stock_ridge_bundle, frame=day)
-        lasso_pred = predict_linear_model(bundle=stock_lasso_bundle, frame=day)
-
         # Compute stock-level panel IC tables for the test split only.
         if str(day["split"].iloc[0]) == "test":
             minute_ic_tables["xgb"].append(compute_panel_ic_by_minute(day_panel=day, pred=xgb_pred, label_col="label_stock_10m"))
             minute_ic_tables["lgbm"].append(compute_panel_ic_by_minute(day_panel=day, pred=lgbm_pred, label_col="label_stock_10m"))
-            minute_ic_tables["ridge"].append(compute_panel_ic_by_minute(day_panel=day, pred=ridge_pred, label_col="label_stock_10m"))
-            minute_ic_tables["lasso"].append(compute_panel_ic_by_minute(day_panel=day, pred=lasso_pred, label_col="label_stock_10m"))
             stock_ts_stats_tables.append(compute_stock_sufficient_stats(day_panel=day, pred=xgb_pred, label_col="label_stock_10m"))
 
             # Compute per-stock within-day IC for robustness diagnostics.
@@ -475,15 +464,11 @@ def main() -> None:
         basket_xgb["model_name"] = "basket_stock_xgb"
         basket_lgbm = aggregate_day_to_basket(stock_day=day, pred=lgbm_pred, pred_col_name="pred_stock_lgbm")
         basket_lgbm["model_name"] = "basket_stock_lgbm"
-        basket_ridge = aggregate_day_to_basket(stock_day=day, pred=ridge_pred, pred_col_name="pred_stock_ridge")
-        basket_ridge["model_name"] = "basket_stock_ridge"
-        basket_lasso = aggregate_day_to_basket(stock_day=day, pred=lasso_pred, pred_col_name="pred_stock_lasso")
-        basket_lasso["model_name"] = "basket_stock_lasso"
-        basket_rows.append(pd.concat([basket_xgb, basket_lgbm, basket_ridge, basket_lasso], axis=0, ignore_index=True))
+        basket_rows.append(pd.concat([basket_xgb, basket_lgbm], axis=0, ignore_index=True))
 
     # Stage 3: Evaluate Stock Alpha and write basket_pred.parquet (deliverable).
     stock_alpha_overall: dict[str, dict] = {}
-    for model_name in ["xgb", "lgbm", "ridge", "lasso"]:
+    for model_name in ["xgb", "lgbm"]:
         # Summarize pooled minute IC and daily IC for each stock model.
         minute_ic = pd.concat(minute_ic_tables[model_name], axis=0, ignore_index=True)
         daily_ic = summarize_panel_ic_daily(minute_ic=minute_ic)
@@ -616,6 +601,15 @@ def main() -> None:
 
     basis_pred_table = pd.concat(basis_pred_tables, axis=0, ignore_index=True)
     basis_metrics = compute_metrics(pred_table=basis_pred_table)
+    # Enrich basis overall metrics with ICIR computed from the daily IC series (test split only).
+    for model_name in list(basis_metrics["overall"].keys()):
+        daily = pd.DataFrame(basis_metrics["daily"][model_name]).copy()
+        ic_mean = float(daily["ic"].mean())
+        ic_std = float(daily["ic"].std())
+        rank_ic_mean = float(daily["rank_ic"].mean())
+        rank_ic_std = float(daily["rank_ic"].std())
+        basis_metrics["overall"][model_name]["test"]["icir"] = ic_mean / ic_std
+        basis_metrics["overall"][model_name]["test"]["rank_icir"] = rank_ic_mean / rank_ic_std
     basis_pred_path = os.path.join(report_dir, "basis_pred_vs_etf.parquet")
     pd.concat(basis_join_rows, axis=0, ignore_index=True).to_parquet(basis_pred_path, index=False)
 
@@ -706,30 +700,10 @@ def main() -> None:
     basket_branches = {
         "basket_stock_xgb": basket_all.loc[basket_all["model_name"] == "basket_stock_xgb", ["date", "datetime", "split", "basket_pred"]].copy(),
         "basket_stock_lgbm": basket_all.loc[basket_all["model_name"] == "basket_stock_lgbm", ["date", "datetime", "split", "basket_pred"]].copy(),
-        "basket_stock_ridge": basket_all.loc[basket_all["model_name"] == "basket_stock_ridge", ["date", "datetime", "split", "basket_pred"]].copy(),
-        "basket_stock_lasso": basket_all.loc[basket_all["model_name"] == "basket_stock_lasso", ["date", "datetime", "split", "basket_pred"]].copy(),
     }
 
-    # Stage 4: Define basis feature set shared by all branches.
-    basis_features = [
-        "ret_1m",
-        "ret_5m",
-        "ret_10m",
-        "ret_30m",
-        "amt_chg_1m",
-        "rv_10",
-        "rv_20",
-        "vol_roll_mean_20",
-        "vol_roll_std_20",
-        "amt_roll_mean_20",
-        "amt_roll_std_20",
-        "MinuteIndex",
-        "basket_pred",
-    ]
-
-    # Stage 4: Build raw + basis-corrected ETF prediction tables for all basket branches.
+    # Stage 4: Build ETF prediction tables for all basket branches.
     etf_pred_tables: list[pd.DataFrame] = []
-    basis_pairs: list[tuple[str, str]] = []
     for branch_name, basket_pred in basket_branches.items():
         # Build the raw join table for this basket branch.
         joined = etf_dataset.merge(basket_pred, on=["date", "datetime", "split"], how="inner")
@@ -743,102 +717,15 @@ def main() -> None:
             )
         )
 
-        # Build residual label and clean infinities for linear regression stability.
-        joined = joined.copy()
-        joined["basis_realized"] = joined["label_etf_10m"] - joined["basket_pred"]
-        joined = joined.replace([np.inf, -np.inf], np.nan)
-
-        # Fit linear basis model on train split for this branch.
-        basis_train = joined.loc[joined["split"] == "train"].copy()
-        basis_model = fit_basis_linear_model(train=basis_train, features=basis_features, label_col="basis_realized")
-
-        # Predict basis and form bottom-up corrected prediction.
-        basis_pred = np.full(shape=(len(joined),), fill_value=np.nan, dtype=float)
-        basis_mask = np.isfinite(joined[basis_features].to_numpy(dtype=float)).all(axis=1)
-        basis_pred[basis_mask] = basis_model.predict(joined.loc[basis_mask, basis_features].to_numpy())
-        bottom_up_pred = joined["basket_pred"].to_numpy(dtype=float) + basis_pred
-
-        # Record the raw->basis pair for delta plots and reporting.
-        basis_model_name = f"{branch_name}_plus_basis"
-        basis_pairs.append((str(raw_model_name), str(basis_model_name)))
-
-        # Append basis-corrected ETF prediction table.
-        etf_pred_tables.append(
-            make_etf_prediction_table(
-                frame=joined,
-                model_name=basis_model_name,
-                pred=bottom_up_pred,
-                label_col="label_etf_10m",
-            )
-        )
-
-    # Stage 4: Add benchmark baselines on the ETF label series.
-    baseline_frame = etf_dataset.loc[:, ["datetime", "split", "label_etf_10m"]].copy()
-    baseline_frame = baseline_frame.rename(columns={"datetime": "DateTime", "label_etf_10m": "label"})
-    baseline_with_preds = compute_baseline_preds(frame=baseline_frame, horizon_minutes=label_horizon_minutes)
-    etf_pred_tables.append(
-        make_etf_prediction_table(
-            frame=etf_dataset,
-            model_name="benchmark_zero",
-            pred=baseline_with_preds["pred_zero"].to_numpy(dtype=float),
-            label_col="label_etf_10m",
-        )
-    )
-    etf_pred_tables.append(
-        make_etf_prediction_table(
-            frame=etf_dataset,
-            model_name="benchmark_last_value",
-            pred=baseline_with_preds["pred_last_value"].to_numpy(dtype=float),
-            label_col="label_etf_10m",
-        )
-    )
-    etf_pred_tables.append(
-        make_etf_prediction_table(
-            frame=etf_dataset,
-            model_name="benchmark_rolling_mean_20",
-            pred=baseline_with_preds["pred_rolling_mean"].to_numpy(dtype=float),
-            label_col="label_etf_10m",
-        )
-    )
-
     # Stage 5: Compute ETF-level metrics and write predictions parquet.
     etf_pred_table = pd.concat(etf_pred_tables, axis=0, ignore_index=True)
     etf_pred_path = os.path.join(report_dir, "predictions.parquet")
     etf_pred_table.to_parquet(etf_pred_path, index=False)
     etf_metrics = compute_metrics(pred_table=etf_pred_table)
 
-    # Stage 5: Build a basis-corrected evaluation table for basket branches only.
-    basis_corrected_models = [f"{name}_plus_basis" for name in basket_branches.keys()]
-    basis_corrected_overall: dict[str, dict] = {}
-    for model_name in basis_corrected_models:
-        # Copy overall metrics and enrich with ICIR computed from daily IC series.
-        row = {k: dict(v) for k, v in etf_metrics["overall"][model_name].items()}
-        daily = pd.DataFrame(etf_metrics["daily"][model_name]).copy()
-        ic_mean = float(daily["ic"].mean())
-        ic_std = float(daily["ic"].std())
-        rank_ic_mean = float(daily["rank_ic"].mean())
-        rank_ic_std = float(daily["rank_ic"].std())
-        row["test"]["icir"] = float(ic_mean / ic_std)
-        row["test"]["rank_icir"] = float(rank_ic_mean / rank_ic_std)
-        basis_corrected_overall[str(model_name)] = row
-    scored_basis = [(name, float(basis_corrected_overall[name]["test"]["ic"])) for name in basis_corrected_models]
-    scored_basis_sorted = sorted(scored_basis, key=lambda x: (np.nan_to_num(x[1], nan=-1e9)), reverse=True)
-    best_basis_corrected_model = str(scored_basis_sorted[0][0])
-    best_basis_corrected_row = etf_metrics["overall"][best_basis_corrected_model]["test"]
-    best_basis_corrected_daily = pd.DataFrame(etf_metrics["rolling"][best_basis_corrected_model]).copy()
-    plot_daily_timeseries(
-        daily=best_basis_corrected_daily,
-        value_col="ic",
-        roll_20_col="ic_roll_20",
-        roll_60_col="ic_roll_60",
-        title=f"Basis-corrected IC ({best_basis_corrected_model}, test)",
-        out_path=os.path.join(report_dir, "fig_basis_corrected_best_daily_ic.png"),
-    )
-
     # Stage 5: Choose the best model by ETF test RankIC (selection rule in AGENTS.md).
     best_model = pick_best_model_by_metric(etf_overall=etf_metrics["overall"], split="test", metric_name="rank_ic")
     best_row = etf_metrics["overall"][best_model]["test"]
-    raw_vs_basis_delta_test = compute_raw_vs_basis_delta_test(etf_overall=etf_metrics["overall"], pairs=basis_pairs)
 
     # Stage 5: Assemble one metrics.yaml for the full three-layer evaluation.
     metrics = {
@@ -854,21 +741,27 @@ def main() -> None:
         },
         "stock_alpha": stock_alpha_metrics,
         "basis_eval": {
-            "overall": basis_corrected_overall,
-            "raw_overall": basis_metrics["overall"],
+            "overall": basis_metrics["overall"],
             "selection": {
                 "selection_key": "test_ic",
-                "selected_model": str(best_basis_corrected_model),
-                "selected_test_ic": float(best_basis_corrected_row["ic"]),
-                "selected_test_rank_ic": float(best_basis_corrected_row["rank_ic"]),
-                "selected_test_rmse": float(best_basis_corrected_row["rmse"]),
-                "selected_test_mae": float(best_basis_corrected_row["mae"]),
+                "selected_model": str(best_basis_model),
+                "selected_test_ic": float(basis_metrics["overall"][best_basis_model]["test"]["ic"]),
+                "selected_test_rank_ic": float(basis_metrics["overall"][best_basis_model]["test"]["rank_ic"]),
+                "selected_test_rmse": float(basis_metrics["overall"][best_basis_model]["test"]["rmse"]),
+                "selected_test_mae": float(basis_metrics["overall"][best_basis_model]["test"]["mae"]),
             },
             "artifacts": {
                 "basis_pred_vs_etf_parquet": "basis_pred_vs_etf.parquet",
                 "fig_basis_best_daily_ic": "fig_basis_best_daily_ic.png",
-                "fig_basis_corrected_best_daily_ic": "fig_basis_corrected_best_daily_ic.png",
             },
+        },
+        "selection": {
+            "selection_key": "test_ic",
+            "selected_model": str(best_basis_model),
+            "selected_test_ic": float(basis_metrics["overall"][best_basis_model]["test"]["ic"]),
+            "selected_test_rank_ic": float(basis_metrics["overall"][best_basis_model]["test"]["rank_ic"]),
+            "selected_test_rmse": float(basis_metrics["overall"][best_basis_model]["test"]["rmse"]),
+            "selected_test_mae": float(basis_metrics["overall"][best_basis_model]["test"]["mae"]),
         },
         "synthetic_vs_real_etf": {
             "overall": synthetic_vs_real,
@@ -881,15 +774,7 @@ def main() -> None:
             },
         },
         "basket_synthesis": {"overall": basket_metrics["overall"]},
-        "etf_level": {"overall": etf_metrics["overall"], "raw_vs_basis_delta_test": raw_vs_basis_delta_test},
-        "selection": {
-            "selection_key": "test_ic",
-            "selected_model": str(best_basis_corrected_model),
-            "selected_test_ic": float(best_basis_corrected_row["ic"]),
-            "selected_test_rank_ic": float(best_basis_corrected_row["rank_ic"]),
-            "selected_test_rmse": float(best_basis_corrected_row["rmse"]),
-            "selected_test_mae": float(best_basis_corrected_row["mae"]),
-        },
+        "etf_level": {"overall": etf_metrics["overall"]},
         "selection_etf": {
             "selection_key": "test_rank_ic",
             "selected_model": str(best_model),
@@ -915,12 +800,6 @@ def main() -> None:
     # Stage 5: Plot unified comparisons and stability figures for report.md.
     plot_baseline_comparison(metrics=basket_metrics, split="test", out_path=os.path.join(report_dir, "fig_basket_branch_compare_test.png"))
     plot_baseline_comparison(metrics=etf_metrics, split="test", out_path=os.path.join(report_dir, "fig_etf_branch_compare_test.png"))
-    plot_raw_vs_basis_delta(
-        overall_metrics=etf_metrics["overall"],
-        split="test",
-        pairs=basis_pairs,
-        out_path=os.path.join(report_dir, "fig_raw_vs_basis_delta_test.png"),
-    )
     best_daily = pd.DataFrame(etf_metrics["rolling"][best_model]).copy()
     plot_daily_timeseries(
         daily=best_daily,

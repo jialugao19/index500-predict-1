@@ -412,12 +412,20 @@ def write_bottom_up_report_md(report_dir: str, run_id: str, metrics: dict) -> No
     lines.append("## Part 1: Stock Alpha (个股端)")
     lines.append("")
     stock = metrics["stock_alpha"]
-    lines.append(
-        f"- Stock XGB panel IC (test, mean over minutes): IC={float(stock['panel_ic_test_mean']):.6f}, RankIC={float(stock['panel_rank_ic_test_mean']):.6f}."
-    )
-    lines.append(
-        f"- Stock XGB daily IC (test, mean over days): IC={float(stock['daily_ic_test_mean']):.6f}, RankIC={float(stock['daily_rank_ic_test_mean']):.6f}."
-    )
+    if "overall" in stock:
+        lines.append("- Stock panel IC (test, mean over minutes):")
+        for model_name in sorted(stock["overall"].keys()):
+            row = stock["overall"][model_name]
+            lines.append(
+                f"  - {model_name}: IC={float(row['panel_ic_test_mean']):.6f}, RankIC={float(row['panel_rank_ic_test_mean']):.6f}."
+            )
+        lines.append("- Stock daily IC (test, mean over days):")
+        for model_name in sorted(stock["overall"].keys()):
+            row = stock["overall"][model_name]
+            lines.append(
+                f"  - {model_name}: IC={float(row['daily_ic_test_mean']):.6f}, RankIC={float(row['daily_rank_ic_test_mean']):.6f}, "
+                f"ICIR={float(row['daily_icir_test']):.3f}, RankICIR={float(row['daily_rank_icir_test']):.3f}."
+            )
     if "overall" in stock:
         lines.append("")
         lines.append("### Stock 模型对比 (test)")
@@ -544,15 +552,6 @@ def write_bottom_up_report_md(report_dir: str, run_id: str, metrics: dict) -> No
             f"- Selected test metrics: IC=`{float(sel['selected_test_ic']):.6f}`, RankIC=`{float(sel['selected_test_rank_ic']):.6f}`, RMSE=`{float(sel['selected_test_rmse']):.6f}`, MAE=`{float(sel['selected_test_mae']):.6f}`."
         )
         lines.append("")
-    lines.append("### Raw vs Basis (Delta, test)")
-    lines.append("")
-    lines.append("| raw_model | basis_model | ic_delta | rank_ic_delta |")
-    lines.append("| --- | --- | --- | --- |")
-    for row in metrics["etf_level"]["raw_vs_basis_delta_test"]:
-        lines.append(
-            f"| {row['raw_model']} | {row['basis_model']} | {float(row['ic_delta']):.6f} | {float(row['rank_ic_delta']):.6f} |"
-        )
-    lines.append("")
     lines.append("## 图表 (Figures)")
     lines.append("")
     lines.append("![Basket branch comparison (test)](fig_basket_branch_compare_test.png)")
@@ -564,10 +563,8 @@ def write_bottom_up_report_md(report_dir: str, run_id: str, metrics: dict) -> No
         lines.append("")
         lines.append("![Stock LightGBM feature importance](fig_stock_lgbm_feature_importance.png)")
         lines.append("")
-    lines.append("![Raw vs basis delta (test)](fig_raw_vs_basis_delta_test.png)")
-    lines.append("")
     if "basis_eval" in metrics:
-        lines.append("![Best basis-corrected daily IC (test)](fig_basis_corrected_best_daily_ic.png)")
+        lines.append("![Basis IC best branch (test)](fig_basis_best_daily_ic.png)")
         lines.append("")
     lines.append("![Best model daily IC (test)](fig_best_daily_ic.png)")
     lines.append("")

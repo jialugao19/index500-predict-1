@@ -119,10 +119,15 @@ def build_stock_panel_day(
 
     # Compute return-momentum features using only t and past information.
     merged["ret_1"] = merged["Close"] / grp["Close"].shift(1) - 1.0
+    # Compute extra alpha101-style multi-horizon momentum features.
+    merged["ret_2"] = merged["Close"] / grp["Close"].shift(2) - 1.0
     merged["ret_5"] = merged["Close"] / grp["Close"].shift(5) - 1.0
     merged["ret_10"] = merged["Close"] / grp["Close"].shift(10) - 1.0
+    merged["ret_15"] = merged["Close"] / grp["Close"].shift(15) - 1.0
+    merged["ret_20"] = merged["Close"] / grp["Close"].shift(20) - 1.0
     merged["ret_30"] = merged["Close"] / grp["Close"].shift(30) - 1.0
     merged["ret_60"] = merged["Close"] / grp["Close"].shift(60) - 1.0
+    merged["ret_120"] = merged["Close"] / grp["Close"].shift(120) - 1.0
     open_px = grp["Open"].transform("first").astype(float)
     merged["ret_open"] = merged["Close"].astype(float) / open_px - 1.0
     merged = merged.replace([np.inf, -np.inf], np.nan)
@@ -133,6 +138,15 @@ def build_stock_panel_day(
     vol_roll_sum_5 = grp["Vol"].rolling(window=5, min_periods=5).sum().reset_index(level=0, drop=True)
     merged["vol_change_1"] = merged["Vol"].astype(float) / vol_roll_mean_5.astype(float)
     merged["vol_change_5"] = vol_roll_sum_5.astype(float) / (vol_roll_mean_30.astype(float) * 5.0)
+    # Compute alpha101-style rolling volume/amount levels and dispersions.
+    merged["vol_roll_mean_10"] = grp["Vol"].rolling(window=10, min_periods=10).mean().reset_index(level=0, drop=True).to_numpy(dtype=float)
+    merged["vol_roll_std_10"] = grp["Vol"].rolling(window=10, min_periods=10).std().reset_index(level=0, drop=True).to_numpy(dtype=float)
+    merged["vol_roll_mean_60"] = grp["Vol"].rolling(window=60, min_periods=60).mean().reset_index(level=0, drop=True).to_numpy(dtype=float)
+    merged["vol_roll_std_60"] = grp["Vol"].rolling(window=60, min_periods=60).std().reset_index(level=0, drop=True).to_numpy(dtype=float)
+    merged["amt_roll_mean_10"] = grp["Amount"].rolling(window=10, min_periods=10).mean().reset_index(level=0, drop=True).to_numpy(dtype=float)
+    merged["amt_roll_std_10"] = grp["Amount"].rolling(window=10, min_periods=10).std().reset_index(level=0, drop=True).to_numpy(dtype=float)
+    merged["amt_roll_mean_60"] = grp["Amount"].rolling(window=60, min_periods=60).mean().reset_index(level=0, drop=True).to_numpy(dtype=float)
+    merged["amt_roll_std_60"] = grp["Amount"].rolling(window=60, min_periods=60).std().reset_index(level=0, drop=True).to_numpy(dtype=float)
     merged = merged.replace([np.inf, -np.inf], np.nan)
 
     # Compute price-volume relation features using only past information.
@@ -155,7 +169,10 @@ def build_stock_panel_day(
 
     # Compute volatility features from rolling return dispersion and OHLC range.
     merged["volatility_10"] = grp["ret_1"].rolling(window=10, min_periods=10).std().reset_index(level=0, drop=True).to_numpy(dtype=float)
+    # Compute extra alpha101-style volatility horizons.
+    merged["volatility_20"] = grp["ret_1"].rolling(window=20, min_periods=20).std().reset_index(level=0, drop=True).to_numpy(dtype=float)
     merged["volatility_30"] = grp["ret_1"].rolling(window=30, min_periods=30).std().reset_index(level=0, drop=True).to_numpy(dtype=float)
+    merged["volatility_60"] = grp["ret_1"].rolling(window=60, min_periods=60).std().reset_index(level=0, drop=True).to_numpy(dtype=float)
     range_window = 30
     win_high = grp["High"].rolling(window=range_window, min_periods=range_window).max().reset_index(level=0, drop=True)
     win_low = grp["Low"].rolling(window=range_window, min_periods=range_window).min().reset_index(level=0, drop=True)
@@ -163,20 +180,74 @@ def build_stock_panel_day(
     merged["high_low_range"] = (win_high.astype(float) - win_low.astype(float)) / open_start
     merged = merged.replace([np.inf, -np.inf], np.nan)
 
+    # Compute alpha101-style price-position and candle-shape features.
+    win_high_10 = grp["High"].rolling(window=10, min_periods=10).max().reset_index(level=0, drop=True)
+    win_low_10 = grp["Low"].rolling(window=10, min_periods=10).min().reset_index(level=0, drop=True)
+    merged["price_pos_10"] = (merged["Close"].astype(float) - win_low_10.astype(float)) / (win_high_10.astype(float) - win_low_10.astype(float))
+    merged["price_pos_30"] = (merged["Close"].astype(float) - win_low.astype(float)) / (win_high.astype(float) - win_low.astype(float))
+    win_high_60 = grp["High"].rolling(window=60, min_periods=60).max().reset_index(level=0, drop=True)
+    win_low_60 = grp["Low"].rolling(window=60, min_periods=60).min().reset_index(level=0, drop=True)
+    merged["price_pos_60"] = (merged["Close"].astype(float) - win_low_60.astype(float)) / (win_high_60.astype(float) - win_low_60.astype(float))
+    merged["oc_ret_1"] = (merged["Close"].astype(float) - merged["Open"].astype(float)) / merged["Open"].astype(float)
+    merged["hl_spread_1"] = (merged["High"].astype(float) - merged["Low"].astype(float)) / merged["Open"].astype(float)
+    merged = merged.replace([np.inf, -np.inf], np.nan)
+
+    # Compute alpha101-style rolling correlations for simple price-volume effects.
+    merged["log_vol"] = np.log1p(merged["Vol"].astype(float))
+    merged["log_amt"] = np.log1p(merged["Amount"].astype(float))
+    corr_window2 = 20
+    # Rebuild groupby so newly added columns are visible to apply().
+    grp2 = merged.groupby("StockCode", sort=False)
+    corr_ret_log_vol = grp2.apply(
+        lambda part: part["ret_1"].rolling(window=corr_window2, min_periods=corr_window2).corr(part["log_vol"]),
+        include_groups=False,
+    )
+    corr_ret_log_amt = grp2.apply(
+        lambda part: part["ret_1"].rolling(window=corr_window2, min_periods=corr_window2).corr(part["log_amt"]),
+        include_groups=False,
+    )
+    merged["corr_ret_log_vol_20"] = corr_ret_log_vol.reset_index(level=0, drop=True).astype(float)
+    merged["corr_ret_log_amt_20"] = corr_ret_log_amt.reset_index(level=0, drop=True).astype(float)
+    merged = merged.replace([np.inf, -np.inf], np.nan)
+
+    # Compute alpha101-style VWAP momentum as a stable microstructure signal.
+    vwap_shift_10 = vwap.astype(float).groupby(merged["StockCode"]).shift(10)
+    merged["vwap_ret_10"] = vwap.astype(float) / vwap_shift_10.astype(float) - 1.0
+    merged = merged.replace([np.inf, -np.inf], np.nan)
+
+    # Drop intermediate columns to keep the day panel narrow.
+    merged = merged.drop(columns=["log_vol", "log_amt"])
+
     # Enforce the "window contains suspension bar -> NaN" rule for window-based features.
     invalid = invalid_bar.astype(int)
     invalid_roll_2 = invalid.groupby(merged["StockCode"]).rolling(window=2, min_periods=2).sum().reset_index(level=0, drop=True)
+    invalid_roll_3 = invalid.groupby(merged["StockCode"]).rolling(window=3, min_periods=3).sum().reset_index(level=0, drop=True)
     invalid_roll_6 = invalid.groupby(merged["StockCode"]).rolling(window=6, min_periods=6).sum().reset_index(level=0, drop=True)
+    invalid_roll_10 = invalid.groupby(merged["StockCode"]).rolling(window=10, min_periods=10).sum().reset_index(level=0, drop=True)
     invalid_roll_11 = invalid.groupby(merged["StockCode"]).rolling(window=11, min_periods=11).sum().reset_index(level=0, drop=True)
+    invalid_roll_16 = invalid.groupby(merged["StockCode"]).rolling(window=16, min_periods=16).sum().reset_index(level=0, drop=True)
+    invalid_roll_21 = invalid.groupby(merged["StockCode"]).rolling(window=21, min_periods=21).sum().reset_index(level=0, drop=True)
     invalid_roll_31 = invalid.groupby(merged["StockCode"]).rolling(window=31, min_periods=31).sum().reset_index(level=0, drop=True)
+    invalid_roll_60 = invalid.groupby(merged["StockCode"]).rolling(window=60, min_periods=60).sum().reset_index(level=0, drop=True)
     invalid_roll_61 = invalid.groupby(merged["StockCode"]).rolling(window=61, min_periods=61).sum().reset_index(level=0, drop=True)
+    invalid_roll_121 = invalid.groupby(merged["StockCode"]).rolling(window=121, min_periods=121).sum().reset_index(level=0, drop=True)
     merged.loc[invalid_roll_2.to_numpy() > 0, ["ret_1", "vol_change_1"]] = np.nan
+    merged.loc[invalid_roll_3.to_numpy() > 0, ["ret_2"]] = np.nan
     merged.loc[invalid_roll_6.to_numpy() > 0, ["ret_5", "vol_change_5"]] = np.nan
     merged.loc[invalid_roll_11.to_numpy() > 0, ["ret_10", "volatility_10"]] = np.nan
+    merged.loc[invalid_roll_16.to_numpy() > 0, ["ret_15"]] = np.nan
+    merged.loc[invalid_roll_21.to_numpy() > 0, ["ret_20", "volatility_20", "corr_ret_log_vol_20", "corr_ret_log_amt_20"]] = np.nan
     merged.loc[invalid_roll_31.to_numpy() > 0, ["ret_30", "volatility_30", "high_low_range", "amount_ret_corr"]] = np.nan
     merged.loc[invalid_roll_61.to_numpy() > 0, ["ret_60"]] = np.nan
+    merged.loc[invalid_roll_121.to_numpy() > 0, ["ret_120"]] = np.nan
+    merged.loc[invalid_roll_10.to_numpy() > 0, ["vol_roll_mean_10", "vol_roll_std_10", "amt_roll_mean_10", "amt_roll_std_10", "price_pos_10"]] = np.nan
+    merged.loc[invalid_roll_60.to_numpy() > 0, ["vol_roll_mean_60", "vol_roll_std_60", "amt_roll_mean_60", "amt_roll_std_60", "price_pos_60"]] = np.nan
+    merged.loc[invalid_roll_31.to_numpy() > 0, ["price_pos_30"]] = np.nan
+    merged.loc[invalid_roll_61.to_numpy() > 0, ["volatility_60"]] = np.nan
+    merged.loc[invalid_roll_11.to_numpy() > 0, ["vwap_ret_10"]] = np.nan
     invalid_cum = invalid.groupby(merged["StockCode"]).cumsum()
     merged.loc[invalid_cum.to_numpy() > 0, ["ret_open", "vwap_dev", "price_high_dev", "price_low_dev"]] = np.nan
+    merged.loc[invalid_cum.to_numpy() > 0, ["oc_ret_1", "hl_spread_1", "price_pos_10", "price_pos_30", "price_pos_60", "vwap_ret_10"]] = np.nan
 
     # Compute time features without cross-sectional normalization.
     merged["minute_of_day"] = merged["MinuteIndex"].astype(int)
@@ -186,20 +257,42 @@ def build_stock_panel_day(
     # Apply cross-sectional winsorize + rank normalization per minute for non-time features.
     xs_cols = [
         "ret_1",
+        "ret_2",
         "ret_5",
         "ret_10",
+        "ret_15",
+        "ret_20",
         "ret_30",
         "ret_60",
+        "ret_120",
         "ret_open",
         "vol_change_1",
         "vol_change_5",
+        "vol_roll_mean_10",
+        "vol_roll_std_10",
+        "vol_roll_mean_60",
+        "vol_roll_std_60",
+        "amt_roll_mean_10",
+        "amt_roll_std_10",
+        "amt_roll_mean_60",
+        "amt_roll_std_60",
         "vwap_dev",
+        "vwap_ret_10",
         "price_high_dev",
         "price_low_dev",
         "amount_ret_corr",
         "volatility_10",
+        "volatility_20",
         "volatility_30",
+        "volatility_60",
         "high_low_range",
+        "price_pos_10",
+        "price_pos_30",
+        "price_pos_60",
+        "oc_ret_1",
+        "hl_spread_1",
+        "corr_ret_log_vol_20",
+        "corr_ret_log_amt_20",
     ]
     bounds = merged.groupby("DateTime", sort=False)[xs_cols].quantile([0.01, 0.99]).reset_index()
     bounds = bounds.rename(columns={"level_1": "q"})
@@ -229,20 +322,42 @@ def build_stock_panel_day(
             "label_stock_10m",
             "MinuteIndex",
             "ret_1",
+            "ret_2",
             "ret_5",
             "ret_10",
+            "ret_15",
+            "ret_20",
             "ret_30",
             "ret_60",
+            "ret_120",
             "ret_open",
             "vol_change_1",
             "vol_change_5",
+            "vol_roll_mean_10",
+            "vol_roll_std_10",
+            "vol_roll_mean_60",
+            "vol_roll_std_60",
+            "amt_roll_mean_10",
+            "amt_roll_std_10",
+            "amt_roll_mean_60",
+            "amt_roll_std_60",
             "vwap_dev",
+            "vwap_ret_10",
             "price_high_dev",
             "price_low_dev",
             "amount_ret_corr",
             "volatility_10",
+            "volatility_20",
             "volatility_30",
+            "volatility_60",
             "high_low_range",
+            "price_pos_10",
+            "price_pos_30",
+            "price_pos_60",
+            "oc_ret_1",
+            "hl_spread_1",
+            "corr_ret_log_vol_20",
+            "corr_ret_log_amt_20",
             "minute_of_day",
             "is_open_30min",
             "is_close_30min",
