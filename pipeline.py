@@ -594,6 +594,60 @@ def main() -> None:
         .to_dict(orient="records"),
         "artifact_stock_metrics_test": "stock_metrics_test.parquet",
     }
+    # Compute per-stock time-series metrics on the test split for stock-level diagnostics.
+    stock_ts_stats = pd.concat(stock_ts_stats_tables, axis=0, ignore_index=True)
+    stock_ts_stats_sum = stock_ts_stats.groupby("stock_code", sort=True).sum(numeric_only=True).reset_index()
+    stock_ts_metrics = finalize_stock_metrics_from_sufficient_stats(stats=stock_ts_stats_sum)
+
+    # Compute per-stock within-day IC averages as a robustness cross-check.
+    stock_daily_ic = pd.concat(stock_daily_ic_tables, axis=0, ignore_index=True)
+    stock_daily_summary = (
+        stock_daily_ic.groupby("stock_code", sort=True)
+        .agg(
+            daily_ic_mean=("daily_ic", "mean"),
+            daily_rank_ic_mean=("daily_rank_ic", "mean"),
+            days=("daily_ic", "size"),
+            daily_n_sum=("n", "sum"),
+            daily_ic_neg_rate=("daily_ic", lambda s: float(np.mean(s.to_numpy(dtype=float) < 0.0))),
+        )
+        .reset_index()
+    )
+
+    # Merge minute-level and within-day summary tables to one per-stock evaluation table.
+    stock_metrics = stock_ts_metrics.merge(stock_daily_summary, on="stock_code", how="left")
+
+    # Tag stocks as good/bad/neutral using an IC t-stat threshold.
+    ic_t_threshold = 2.0
+    ic_abs_threshold = 0.05
+    stock_metrics["verdict"] = "neutral"
+    stock_metrics.loc[(stock_metrics["ic"] >= ic_abs_threshold) & (stock_metrics["ic_t"] >= ic_t_threshold), "verdict"] = "good"
+    stock_metrics.loc[(stock_metrics["ic"] <= -ic_abs_threshold) & (stock_metrics["ic_t"] <= -ic_t_threshold), "verdict"] = "bad"
+
+    # Write the per-stock table as a parquet artifact for detailed inspection.
+    stock_metrics_path = os.path.join(report_dir, "stock_metrics_test.parquet")
+    stock_metrics.to_parquet(stock_metrics_path, index=False)
+
+    # Add a compact per-stock summary into metrics.yaml for the markdown report.
+    ic_vals = stock_metrics["ic"].to_numpy(dtype=float)
+    ic_vals = ic_vals[np.isfinite(ic_vals)]
+    q05, q50, q95 = np.quantile(ic_vals, [0.05, 0.50, 0.95]) if len(ic_vals) else [float("nan")] * 3
+    verdict_counts = stock_metrics["verdict"].value_counts(dropna=False).to_dict()
+    stock_alpha_metrics["per_stock_test"] = {
+        "ic_t_threshold": float(ic_t_threshold),
+        "ic_abs_threshold": float(ic_abs_threshold),
+        "n_stocks": int(len(stock_metrics)),
+        "verdict_counts": {str(k): int(v) for k, v in verdict_counts.items()},
+        "ic_quantiles": {"q05": float(q05), "q50": float(q50), "q95": float(q95)},
+        "top_ic": stock_metrics.sort_values("ic", ascending=False)
+        .head(10)
+        .loc[:, ["stock_code", "weight_mean", "ic", "ic_t", "direction_acc", "rmse", "mae"]]
+        .to_dict(orient="records"),
+        "bottom_ic": stock_metrics.sort_values("ic", ascending=True)
+        .head(10)
+        .loc[:, ["stock_code", "weight_mean", "ic", "ic_t", "direction_acc", "rmse", "mae"]]
+        .to_dict(orient="records"),
+        "artifact_stock_metrics_test": "stock_metrics_test.parquet",
+    }
 
     basket_all = pd.concat(basket_rows, axis=0, ignore_index=True)
     basket_pred_path = os.path.join(report_dir, "basket_pred.parquet")
