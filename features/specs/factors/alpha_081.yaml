@@ -1,0 +1,14 @@
+name_en: alpha_081
+name_zh: Alpha#81
+formula: ((rank(Log(product(rank((rank(correlation(vwap, sum(adv10, 49.6054), 8.47743))^4)),
+  14.9655))) < rank(correlation(rank(vwap), rank(volume), 5.07914))) * -1)
+inputs:
+- Open
+- High
+- Low
+- Close
+- Vol
+- Amount
+tags:
+- stock
+- alpha101

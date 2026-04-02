@@ -1,0 +1,14 @@
+name_en: alpha_065
+name_zh: Alpha#65
+formula: ((rank(correlation(((open * 0.00817205) + (vwap * (1 - 0.00817205))), sum(adv60,
+  8.6911), 6.40374)) < rank((open - ts_min(open, 13.635)))) * -1)
+inputs:
+- Open
+- High
+- Low
+- Close
+- Vol
+- Amount
+tags:
+- stock
+- alpha101

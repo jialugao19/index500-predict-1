@@ -1,0 +1,6 @@
+name_en: amt_chg_1m
+name_zh: ETF 1分钟成交额变化
+formula: TS_RETURNS(AMOUNT, 1, 1)
+inputs: [Amount]
+tags: [etf, liquidity]
+

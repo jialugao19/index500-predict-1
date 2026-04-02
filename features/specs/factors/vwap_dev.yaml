@@ -1,0 +1,6 @@
+name_en: vwap_dev
+name_zh: 收盘价相对日内VWAP偏离
+formula: (CLOSE - VWAP) / VWAP
+inputs: [Close, Vol, Amount]
+tags: [stock, microstructure]
+

@@ -1,0 +1,14 @@
+name_en: alpha_020
+name_zh: Alpha#20
+formula: (((-1 * rank((open - delay(high, 1)))) * rank((open - delay(close, 1))))
+  * rank((open - delay(low, 1))))
+inputs:
+- Open
+- High
+- Low
+- Close
+- Vol
+- Amount
+tags:
+- stock
+- alpha101

@@ -1,0 +1,13 @@
+name_en: alpha_013
+name_zh: Alpha#13
+formula: (-1 * rank(covariance(rank(close), rank(volume), 5)))
+inputs:
+- Open
+- High
+- Low
+- Close
+- Vol
+- Amount
+tags:
+- stock
+- alpha101

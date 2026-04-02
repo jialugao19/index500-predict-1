@@ -1,0 +1,6 @@
+name_en: volatility_10
+name_zh: 10分钟收益波动率
+formula: TS_STD(TS_RETURNS(CLOSE, 1, 1), 10)
+inputs: [Close]
+tags: [stock, volatility]
+

@@ -1,0 +1,40 @@
+name: stock_default
+scope: stock
+factors:
+  - ret_1
+  - ret_5
+  - ret_10
+  - ret_30
+  - ret_60
+  - ret_open
+  - vol_change_1
+  - vol_change_5
+  - vwap_dev
+  - price_high_dev
+  - price_low_dev
+  - amount_ret_corr
+  - volatility_10
+  - volatility_30
+  - high_low_range
+xs_clip_rank_factors:
+  - ret_1
+  - ret_5
+  - ret_10
+  - ret_30
+  - ret_60
+  - ret_open
+  - vol_change_1
+  - vol_change_5
+  - vwap_dev
+  - price_high_dev
+  - price_low_dev
+  - amount_ret_corr
+  - volatility_10
+  - volatility_30
+  - high_low_range
+invalid_after_first_invalid_factors:
+  - ret_open
+  - vwap_dev
+  - price_high_dev
+  - price_low_dev
+

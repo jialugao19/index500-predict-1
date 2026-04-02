@@ -1,0 +1,14 @@
+name_en: alpha_077
+name_zh: Alpha#77
+formula: min(rank(decay_linear(((((high + low) / 2) + high) - (vwap + high)), 20.0451)),
+  rank(decay_linear(correlation(((high + low) / 2), adv40, 3.1614), 5.64125)))
+inputs:
+- Open
+- High
+- Low
+- Close
+- Vol
+- Amount
+tags:
+- stock
+- alpha101

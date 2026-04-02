@@ -1,0 +1,6 @@
+name_en: vol_roll_mean_20
+name_zh: ETF 20分钟成交量均值
+formula: TS_MEAN(VOL, 20)
+inputs: [Vol]
+tags: [etf, liquidity]
+

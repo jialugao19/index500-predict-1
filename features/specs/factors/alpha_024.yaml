@@ -1,0 +1,15 @@
+name_en: alpha_024
+name_zh: Alpha#24
+formula: '((((delta((sum(close, 100) / 100), 100) / delay(close, 100)) < 0.05) ||
+  ((delta((sum(close, 100) / 100), 100) / delay(close, 100)) == 0.05)) ? (-1 * (close
+  - ts_min(close, 100))) : (-1 * delta(close, 3)))'
+inputs:
+- Open
+- High
+- Low
+- Close
+- Vol
+- Amount
+tags:
+- stock
+- alpha101

@@ -1,0 +1,16 @@
+name_en: alpha_046
+name_zh: Alpha#46
+formula: '((0.25 < (((delay(close, 20) - delay(close, 10)) / 10) - ((delay(close,
+  10) - close) / 10))) ? (-1 * 1) : (((((delay(close, 20) - delay(close, 10)) / 10)
+  - ((delay(close, 10) - close) / 10)) < 0) ? 1 : ((-1 * 1) * (close - delay(close,
+  1)))))'
+inputs:
+- Open
+- High
+- Low
+- Close
+- Vol
+- Amount
+tags:
+- stock
+- alpha101

@@ -1,0 +1,6 @@
+name_en: amt_roll_mean_20
+name_zh: ETF 20分钟成交额均值
+formula: TS_MEAN(AMOUNT, 20)
+inputs: [Amount]
+tags: [etf, liquidity]
+

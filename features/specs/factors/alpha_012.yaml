@@ -1,0 +1,13 @@
+name_en: alpha_012
+name_zh: Alpha#12
+formula: (sign(delta(volume, 1)) * (-1 * delta(close, 1)))
+inputs:
+- Open
+- High
+- Low
+- Close
+- Vol
+- Amount
+tags:
+- stock
+- alpha101

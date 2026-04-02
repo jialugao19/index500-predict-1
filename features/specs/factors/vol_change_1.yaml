@@ -1,0 +1,6 @@
+name_en: vol_change_1
+name_zh: 成交量相对5分钟均值
+formula: VOL / TS_MEAN(VOL, 5)
+inputs: [Vol]
+tags: [stock, volume]
+

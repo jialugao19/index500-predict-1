@@ -1,0 +1,15 @@
+name_en: alpha_092
+name_zh: Alpha#92
+formula: min(Ts_Rank(decay_linear(((((high + low) / 2) + close) < (low + open)), 14.7221),
+  18.8683), Ts_Rank(decay_linear(correlation(rank(low), rank(adv30), 7.58555), 6.94024),
+  6.80584))
+inputs:
+- Open
+- High
+- Low
+- Close
+- Vol
+- Amount
+tags:
+- stock
+- alpha101

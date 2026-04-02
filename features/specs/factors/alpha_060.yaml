@@ -1,0 +1,14 @@
+name_en: alpha_060
+name_zh: Alpha#60
+formula: (0 - (1 * ((2 * scale(rank(((((close - low) - (high - close)) / (high - low))
+  * volume)))) - scale(rank(ts_argmax(close, 10))))))
+inputs:
+- Open
+- High
+- Low
+- Close
+- Vol
+- Amount
+tags:
+- stock
+- alpha101

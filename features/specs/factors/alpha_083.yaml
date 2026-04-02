@@ -1,0 +1,14 @@
+name_en: alpha_083
+name_zh: Alpha#83
+formula: ((rank(delay(((high - low) / (sum(close, 5) / 5)), 2)) * rank(rank(volume)))
+  / (((high - low) / (sum(close, 5) / 5)) / (vwap - close)))
+inputs:
+- Open
+- High
+- Low
+- Close
+- Vol
+- Amount
+tags:
+- stock
+- alpha101

@@ -1,0 +1,15 @@
+name_en: alpha_098
+name_zh: Alpha#98
+formula: (rank(decay_linear(correlation(vwap, sum(adv5, 26.4719), 4.58418), 7.18088))
+  - rank(decay_linear(Ts_Rank(Ts_ArgMin(correlation(rank(open), rank(adv15), 20.8187),
+  8.62571), 6.95668), 8.07206)))
+inputs:
+- Open
+- High
+- Low
+- Close
+- Vol
+- Amount
+tags:
+- stock
+- alpha101

@@ -1,0 +1,14 @@
+name_en: alpha_099
+name_zh: Alpha#99
+formula: ((rank(correlation(sum(((high + low) / 2), 19.8975), sum(adv60, 19.8975),
+  8.8136)) < rank(correlation(low, volume, 6.28259))) * -1)
+inputs:
+- Open
+- High
+- Low
+- Close
+- Vol
+- Amount
+tags:
+- stock
+- alpha101

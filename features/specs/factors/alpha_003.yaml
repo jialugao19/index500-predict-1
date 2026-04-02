@@ -1,0 +1,13 @@
+name_en: alpha_003
+name_zh: Alpha#3
+formula: (-1 * correlation(rank(open), rank(volume), 10))
+inputs:
+- Open
+- High
+- Low
+- Close
+- Vol
+- Amount
+tags:
+- stock
+- alpha101

@@ -7,6 +7,8 @@ import time
 import numpy as np
 import pandas as pd
 
+from features.manifest import build_factor_set_manifest
+from features.registry import cached_load_registry
 from eval.metrics import (
     compute_error_summary,
     compute_metrics,
@@ -25,7 +27,8 @@ from eval.stock_level import (
     summarize_panel_ic_daily,
 )
 from eval.walk_forward import run_walk_forward_validation
-from features.etf import compute_etf_features, compute_label_from_close
+from features.builders.etf import build_etf_features_day
+from features.etf import compute_label_from_close
 from models.lgbm import fit_lgbm_model
 from models.xgb import fit_xgb_model
 from eval.plots import (
@@ -225,7 +228,10 @@ def collect_stock_training_sample(
     weights: pd.DataFrame,
     stock1m_root: str,
     horizon_minutes: int,
-    cache_root: str,
+    base_cache_root: str,
+    feature_cache_root: str,
+    specs_root: str,
+    factor_set_name: str,
     feature_cols: list[str],
     max_rows: int,
     sample_mod: int,
@@ -241,7 +247,10 @@ def collect_stock_training_sample(
             weights=weights,
             stock1m_root=stock1m_root,
             horizon_minutes=horizon_minutes,
-            cache_root=cache_root,
+            base_cache_root=base_cache_root,
+            feature_cache_root=feature_cache_root,
+            specs_root=specs_root,
+            factor_set_name=factor_set_name,
         )
         day = day.loc[day["split"] == "train"].copy()
         day = day.dropna(subset=["label_stock_10m"])
@@ -265,6 +274,8 @@ def build_etf_minute_dataset(
     etf1m_root: str,
     etf_code_int: int,
     horizon_minutes: int,
+    specs_root: str,
+    factor_set_name: str,
 ) -> pd.DataFrame:
     """Build ETF minute feature/label dataset for basis modeling and evaluation."""
 
@@ -273,7 +284,7 @@ def build_etf_minute_dataset(
     for date in dates:
         # Load ETF bars and compute ETF features and label.
         etf_day = load_etf_minute_bars(etf1m_root=etf1m_root, date=int(date), etf_code_int=etf_code_int)
-        etf_features = compute_etf_features(etf_day=etf_day)
+        etf_features = build_etf_features_day(etf_day=etf_day, specs_root=specs_root, factor_set_name=factor_set_name)
         label = compute_label_from_close(etf_day=etf_day, horizon_minutes=horizon_minutes)
 
         # Assemble a day frame with stable columns for joins.
@@ -297,12 +308,14 @@ def sample_spot_checks(
     etf_code_int: int,
     num_checks: int,
     horizon_minutes: int,
+    specs_root: str,
+    factor_set_name: str,
 ) -> list[dict]:
     """Sample spot checks to demonstrate no look-ahead."""
 
     # Load the ETF day and compute label and features for inspection.
     etf_day = load_etf_minute_bars(etf1m_root=etf1m_root, date=date, etf_code_int=etf_code_int)
-    features = compute_etf_features(etf_day=etf_day)
+    features = build_etf_features_day(etf_day=etf_day, specs_root=specs_root, factor_set_name=factor_set_name)
     label = compute_label_from_close(etf_day=etf_day, horizon_minutes=horizon_minutes)
 
     # Pick deterministic indices away from the ends to allow t+10.
@@ -349,7 +362,11 @@ def main() -> None:
     weight_path = "/data/ashare/market/index_weight/000905.feather"
     etf1m_root = "/data/ashare/market/etf1m"
     stock1m_root = "/data/ashare/market/stock1m"
-    stock_panel_cache_root = "/data-cache/index500-predict/stock_panel_days_v2"
+    factor_set_name = "stock_default"
+    etf_factor_set_name = "etf_default"
+    specs_root = os.path.join(repo_root, "features", "specs")
+    stock_panel_base_cache_root = f"/data-cache/index500-predict/stock_base_days_v1__h{label_horizon_minutes}"
+    stock_panel_feature_cache_root = f"/data-cache/index500-predict/stock_feature_days_v1__{factor_set_name}__h{label_horizon_minutes}"
     # Create output run directory under repo report folder grouped by month-day for easy browsing.
     now = dt.datetime.now()
     day_tag = now.strftime("%m%d")
@@ -365,6 +382,10 @@ def main() -> None:
     all_dates = list_available_dates_from_etf1m_dir(etf1m_dir=etf1m_root)
     train_dates = filter_dates_by_range(all_dates=all_dates, start_date=train_start, end_date=train_end)
     test_dates = filter_dates_by_range(all_dates=all_dates, start_date=test_start, end_date=test_end)
+
+    # Bound the number of train days used for fitting to keep the end-to-end run time reasonable.
+    max_train_days_for_fit = 200
+    train_dates = train_dates[-int(max_train_days_for_fit) :]
     dates_needed = list(train_dates) + list(test_dates)
     print(f"[INFO] Available dates={len(all_dates)}, using train_dates={len(train_dates)}, test_dates={len(test_dates)}.")
 
@@ -381,11 +402,21 @@ def main() -> None:
         weights=weights,
         stock1m_root=stock1m_root,
         horizon_minutes=label_horizon_minutes,
-        cache_root=stock_panel_cache_root,
+        base_cache_root=stock_panel_base_cache_root,
+        feature_cache_root=stock_panel_feature_cache_root,
+        specs_root=specs_root,
+        factor_set_name=factor_set_name,
         out_path=stock_panel_path,
     )
     stock_feature_cols = stock_panel_meta["feature_cols"]
     print(f"[INFO] Stock panel rows_written={int(stock_panel_meta['rows_written'])}.")
+
+    # Write factor manifest for provenance and future factor-set driven training.
+    registry = cached_load_registry(specs_root=specs_root)
+    stock_manifest = build_factor_set_manifest(registry=registry, factor_set_name=factor_set_name)
+    stock_manifest["coverage"] = stock_panel_meta["feature_coverage"]
+    etf_manifest = build_factor_set_manifest(registry=registry, factor_set_name=etf_factor_set_name)
+    write_yaml(path=os.path.join(report_dir, "feature_manifest.yaml"), obj={"stock": stock_manifest, "etf": etf_manifest})
 
     # Stage 2: Fit stock-level models on a deterministic subsample.
     train_sample = collect_stock_training_sample(
@@ -393,7 +424,10 @@ def main() -> None:
         weights=weights,
         stock1m_root=stock1m_root,
         horizon_minutes=label_horizon_minutes,
-        cache_root=stock_panel_cache_root,
+        base_cache_root=stock_panel_base_cache_root,
+        feature_cache_root=stock_panel_feature_cache_root,
+        specs_root=specs_root,
+        factor_set_name=factor_set_name,
         feature_cols=stock_feature_cols,
         max_rows=2_000_000,
         sample_mod=50,
@@ -441,7 +475,10 @@ def main() -> None:
             weights=weights,
             stock1m_root=stock1m_root,
             horizon_minutes=label_horizon_minutes,
-            cache_root=stock_panel_cache_root,
+            base_cache_root=stock_panel_base_cache_root,
+            feature_cache_root=stock_panel_feature_cache_root,
+            specs_root=specs_root,
+            factor_set_name=factor_set_name,
         )
         day = day.loc[day["split"].isin(["train", "test"])].copy()
         day = day.dropna(subset=["label_stock_10m"])
@@ -573,6 +610,8 @@ def main() -> None:
         etf1m_root=etf1m_root,
         etf_code_int=etf_code_int,
         horizon_minutes=label_horizon_minutes,
+        specs_root=specs_root,
+        factor_set_name=etf_factor_set_name,
     )
 
     # Stage 4: Evaluate basket predictions against the real ETF label (Basis evaluation).

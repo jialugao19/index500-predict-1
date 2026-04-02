@@ -1,0 +1,6 @@
+name_en: ret_open
+name_zh: 相对开盘收益率
+formula: CLOSE / OPEN0 - 1
+inputs: [Close, Open]
+tags: [stock, momentum]
+

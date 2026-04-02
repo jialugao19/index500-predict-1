@@ -1,0 +1,13 @@
+name_en: alpha_057
+name_zh: Alpha#57
+formula: (0 - (1 * ((close - vwap) / decay_linear(rank(ts_argmax(close, 30)), 2))))
+inputs:
+- Open
+- High
+- Low
+- Close
+- Vol
+- Amount
+tags:
+- stock
+- alpha101

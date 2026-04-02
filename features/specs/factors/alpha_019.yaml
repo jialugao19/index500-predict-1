@@ -1,0 +1,14 @@
+name_en: alpha_019
+name_zh: Alpha#19
+formula: ((-1 * sign(((close - delay(close, 7)) + delta(close, 7)))) * (1 + rank((1
+  + sum(returns, 250)))))
+inputs:
+- Open
+- High
+- Low
+- Close
+- Vol
+- Amount
+tags:
+- stock
+- alpha101

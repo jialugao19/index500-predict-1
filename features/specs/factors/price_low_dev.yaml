@@ -1,0 +1,6 @@
+name_en: price_low_dev
+name_zh: 收盘价相对日内最低价偏离
+formula: (CLOSE - LOW_SO_FAR) / LOW_SO_FAR
+inputs: [Close, Low]
+tags: [stock, microstructure]
+

@@ -1,0 +1,13 @@
+name_en: alpha_041
+name_zh: Alpha#41
+formula: (((high * low)^0.5) - vwap)
+inputs:
+- Open
+- High
+- Low
+- Close
+- Vol
+- Amount
+tags:
+- stock
+- alpha101

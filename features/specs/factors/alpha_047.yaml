@@ -1,0 +1,14 @@
+name_en: alpha_047
+name_zh: Alpha#47
+formula: ((((rank((1 / close)) * volume) / adv20) * ((high * rank((high - close)))
+  / (sum(high, 5) / 5))) - rank((vwap - delay(vwap, 5))))
+inputs:
+- Open
+- High
+- Low
+- Close
+- Vol
+- Amount
+tags:
+- stock
+- alpha101

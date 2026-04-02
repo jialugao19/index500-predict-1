@@ -1,0 +1,14 @@
+name_en: alpha_002
+name_zh: Alpha#2
+formula: (-1 * correlation(rank(delta(log(volume), 2)), rank(((close - open) / open)),
+  6))
+inputs:
+- Open
+- High
+- Low
+- Close
+- Vol
+- Amount
+tags:
+- stock
+- alpha101

@@ -1,0 +1,14 @@
+name_en: alpha_027
+name_zh: Alpha#27
+formula: '((0.5 < rank((sum(correlation(rank(volume), rank(vwap), 6), 2) / 2.0)))
+  ? (-1 * 1) : 1)'
+inputs:
+- Open
+- High
+- Low
+- Close
+- Vol
+- Amount
+tags:
+- stock
+- alpha101

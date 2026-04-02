@@ -1,0 +1,13 @@
+name_en: alpha_053
+name_zh: Alpha#53
+formula: (-1 * delta((((close - low) - (high - close)) / (close - low)), 9))
+inputs:
+- Open
+- High
+- Low
+- Close
+- Vol
+- Amount
+tags:
+- stock
+- alpha101

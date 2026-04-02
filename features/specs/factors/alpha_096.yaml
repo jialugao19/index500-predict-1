@@ -1,0 +1,15 @@
+name_en: alpha_096
+name_zh: Alpha#96
+formula: (max(Ts_Rank(decay_linear(correlation(rank(vwap), rank(volume), 3.83878),
+  4.16783), 8.38151), Ts_Rank(decay_linear(Ts_ArgMax(correlation(Ts_Rank(close, 7.45404),
+  Ts_Rank(adv60, 4.13242), 3.65459), 12.6556), 14.0365), 13.4143)) * -1)
+inputs:
+- Open
+- High
+- Low
+- Close
+- Vol
+- Amount
+tags:
+- stock
+- alpha101

@@ -1,0 +1,6 @@
+name_en: price_high_dev
+name_zh: 收盘价相对日内最高价偏离
+formula: (CLOSE - HIGH_SO_FAR) / HIGH_SO_FAR
+inputs: [Close, High]
+tags: [stock, microstructure]
+

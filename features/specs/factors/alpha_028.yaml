@@ -1,0 +1,13 @@
+name_en: alpha_028
+name_zh: Alpha#28
+formula: scale(((correlation(adv20, low, 5) + ((high + low) / 2)) - close))
+inputs:
+- Open
+- High
+- Low
+- Close
+- Vol
+- Amount
+tags:
+- stock
+- alpha101

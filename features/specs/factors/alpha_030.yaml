@@ -1,0 +1,15 @@
+name_en: alpha_030
+name_zh: Alpha#30
+formula: (((1.0 - rank(((sign((close - delay(close, 1))) + sign((delay(close, 1) -
+  delay(close, 2)))) + sign((delay(close, 2) - delay(close, 3)))))) * sum(volume,
+  5)) / sum(volume, 20))
+inputs:
+- Open
+- High
+- Low
+- Close
+- Vol
+- Amount
+tags:
+- stock
+- alpha101

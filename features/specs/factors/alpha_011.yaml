@@ -1,0 +1,14 @@
+name_en: alpha_011
+name_zh: Alpha#11
+formula: ((rank(ts_max((vwap - close), 3)) + rank(ts_min((vwap - close), 3))) * rank(delta(volume,
+  3)))
+inputs:
+- Open
+- High
+- Low
+- Close
+- Vol
+- Amount
+tags:
+- stock
+- alpha101

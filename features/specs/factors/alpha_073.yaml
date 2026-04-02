@@ -1,0 +1,15 @@
+name_en: alpha_073
+name_zh: Alpha#73
+formula: (max(rank(decay_linear(delta(vwap, 4.72775), 2.91864)), Ts_Rank(decay_linear(((delta(((open
+  * 0.147155) + (low * (1 - 0.147155))), 2.03608) / ((open * 0.147155) + (low * (1
+  - 0.147155)))) * -1), 3.33829), 16.7411)) * -1)
+inputs:
+- Open
+- High
+- Low
+- Close
+- Vol
+- Amount
+tags:
+- stock
+- alpha101

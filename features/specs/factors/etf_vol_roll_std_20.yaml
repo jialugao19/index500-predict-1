@@ -1,0 +1,6 @@
+name_en: vol_roll_std_20
+name_zh: ETF 20分钟成交量标准差
+formula: TS_STD(VOL, 20)
+inputs: [Vol]
+tags: [etf, liquidity]
+

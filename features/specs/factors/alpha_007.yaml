@@ -1,0 +1,14 @@
+name_en: alpha_007
+name_zh: Alpha#7
+formula: '((adv20 < volume) ? ((-1 * ts_rank(abs(delta(close, 7)), 60)) * sign(delta(close,
+  7))) : (-1 * 1))'
+inputs:
+- Open
+- High
+- Low
+- Close
+- Vol
+- Amount
+tags:
+- stock
+- alpha101

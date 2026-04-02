@@ -1,0 +1,6 @@
+name_en: ret_1
+name_zh: 1分钟收益率
+formula: TS_RETURNS(CLOSE, 1, 1)
+inputs: [Close]
+tags: [stock, momentum]
+

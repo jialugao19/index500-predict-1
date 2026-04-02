@@ -1,0 +1,13 @@
+name_en: alpha_037
+name_zh: Alpha#37
+formula: (rank(correlation(delay((open - close), 1), close, 200)) + rank((open - close)))
+inputs:
+- Open
+- High
+- Low
+- Close
+- Vol
+- Amount
+tags:
+- stock
+- alpha101

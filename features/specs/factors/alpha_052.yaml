@@ -1,0 +1,14 @@
+name_en: alpha_052
+name_zh: Alpha#52
+formula: ((((-1 * ts_min(low, 5)) + delay(ts_min(low, 5), 5)) * rank(((sum(returns,
+  240) - sum(returns, 20)) / 220))) * ts_rank(volume, 5))
+inputs:
+- Open
+- High
+- Low
+- Close
+- Vol
+- Amount
+tags:
+- stock
+- alpha101

@@ -1,0 +1,13 @@
+name_en: alpha_101
+name_zh: Alpha#101
+formula: ((close - open) / ((high - low) + .001))
+inputs:
+- Open
+- High
+- Low
+- Close
+- Vol
+- Amount
+tags:
+- stock
+- alpha101

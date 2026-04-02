@@ -1,0 +1,13 @@
+name_en: alpha_023
+name_zh: Alpha#23
+formula: '(((sum(high, 20) / 20) < high) ? (-1 * delta(high, 2)) : 0)'
+inputs:
+- Open
+- High
+- Low
+- Close
+- Vol
+- Amount
+tags:
+- stock
+- alpha101

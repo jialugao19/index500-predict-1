@@ -1,0 +1,13 @@
+name_en: alpha_040
+name_zh: Alpha#40
+formula: ((-1 * rank(stddev(high, 10))) * correlation(high, volume, 10))
+inputs:
+- Open
+- High
+- Low
+- Close
+- Vol
+- Amount
+tags:
+- stock
+- alpha101

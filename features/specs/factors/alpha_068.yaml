@@ -1,0 +1,14 @@
+name_en: alpha_068
+name_zh: Alpha#68
+formula: ((Ts_Rank(correlation(rank(high), rank(adv15), 8.91644), 13.9333) < rank(delta(((close
+  * 0.518371) + (low * (1 - 0.518371))), 1.06157))) * -1)
+inputs:
+- Open
+- High
+- Low
+- Close
+- Vol
+- Amount
+tags:
+- stock
+- alpha101

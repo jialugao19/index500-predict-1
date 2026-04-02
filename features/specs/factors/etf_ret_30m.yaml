@@ -1,0 +1,6 @@
+name_en: ret_30m
+name_zh: ETF 30分钟收益率
+formula: TS_RETURNS(CLOSE, 30, 1)
+inputs: [Close]
+tags: [etf, momentum]
+

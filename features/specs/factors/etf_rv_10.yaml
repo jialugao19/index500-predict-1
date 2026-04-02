@@ -1,0 +1,6 @@
+name_en: rv_10
+name_zh: ETF 10分钟实现波动率
+formula: SQRT(TS_SUM(POW(TS_RETURNS(CLOSE, 1, 1), 2), 10))
+inputs: [Close]
+tags: [etf, volatility]
+

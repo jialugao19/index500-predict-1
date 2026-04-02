@@ -7,6 +7,9 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from features.builders.stock import build_stock_feature_panel_day
+from features.registry import load_registry
+
 
 def ensure_dir(path: str) -> None:
     """Ensure a directory exists."""
@@ -91,6 +94,27 @@ def build_stock_panel_day(
 ) -> pd.DataFrame:
     """Build one-day stock-level panel with features, weights, and label."""
 
+    # Build the clean base panel first and then delegate factor computation to the feature builder.
+    base = build_stock_base_panel_day(date=date, weights=weights, stock1m_root=stock1m_root, horizon_minutes=horizon_minutes)
+    out = build_stock_feature_panel_day(
+        base_panel=base,
+        specs_root=os.path.join(os.path.dirname(os.path.abspath(__file__)), "features", "specs"),
+        factor_set_name="stock_default",
+    )
+
+    # Attach split as a constant per day so downstream filters stay unchanged.
+    out["split"] = date_to_split(date=int(date))
+    return out
+
+
+def build_stock_base_panel_day(
+    date: int,
+    weights: pd.DataFrame,
+    stock1m_root: str,
+    horizon_minutes: int,
+) -> pd.DataFrame:
+    """Build one-day clean base panel (bars + weights + invalid gating)."""
+
     # Load weights as-of date and constituent stock bars.
     day_weights = get_constituent_weights_for_date(weights=weights, date=date)
     constituents = day_weights["con_int"].to_numpy()
@@ -100,7 +124,7 @@ def build_stock_panel_day(
     merged = stock_day.merge(day_weights, left_on="StockCode", right_on="con_int", how="inner")
     merged = merged.drop(columns=["con_int"]).rename(columns={"weight_frac": "weight"})
 
-    # Mark suspension-like abnormal minutes and enforce "window contains invalid -> NaN" rules.
+    # Mark suspension-like abnormal minutes and replace base fields with NaN on invalid bars.
     grp = merged.groupby("StockCode", sort=False)
     raw_ret_1 = merged["Close"].astype(float) / grp["Close"].shift(1).astype(float) - 1.0
     limit_like = (merged["High"].astype(float) == merged["Low"].astype(float)) & np.isfinite(raw_ret_1.to_numpy(dtype=float)) & (
@@ -115,252 +139,30 @@ def build_stock_panel_day(
         | (~np.isfinite(merged["Close"].astype(float)))
         | limit_like
     )
+    merged["invalid_bar"] = invalid_bar.astype(int)
     merged.loc[invalid_bar, ["Open", "High", "Low", "Close", "Vol", "Amount"]] = np.nan
 
-    # Compute return-momentum features using only t and past information.
-    merged["ret_1"] = merged["Close"] / grp["Close"].shift(1) - 1.0
-    # Compute extra alpha101-style multi-horizon momentum features.
-    merged["ret_2"] = merged["Close"] / grp["Close"].shift(2) - 1.0
-    merged["ret_5"] = merged["Close"] / grp["Close"].shift(5) - 1.0
-    merged["ret_10"] = merged["Close"] / grp["Close"].shift(10) - 1.0
-    merged["ret_15"] = merged["Close"] / grp["Close"].shift(15) - 1.0
-    merged["ret_20"] = merged["Close"] / grp["Close"].shift(20) - 1.0
-    merged["ret_30"] = merged["Close"] / grp["Close"].shift(30) - 1.0
-    merged["ret_60"] = merged["Close"] / grp["Close"].shift(60) - 1.0
-    merged["ret_120"] = merged["Close"] / grp["Close"].shift(120) - 1.0
-    open_px = grp["Open"].transform("first").astype(float)
-    merged["ret_open"] = merged["Close"].astype(float) / open_px - 1.0
-    merged = merged.replace([np.inf, -np.inf], np.nan)
-
-    # Compute volume features using rolling windows with invalid-bar gating.
-    vol_roll_mean_5 = grp["Vol"].rolling(window=5, min_periods=5).mean().reset_index(level=0, drop=True)
-    vol_roll_mean_30 = grp["Vol"].rolling(window=30, min_periods=30).mean().reset_index(level=0, drop=True)
-    vol_roll_sum_5 = grp["Vol"].rolling(window=5, min_periods=5).sum().reset_index(level=0, drop=True)
-    merged["vol_change_1"] = merged["Vol"].astype(float) / vol_roll_mean_5.astype(float)
-    merged["vol_change_5"] = vol_roll_sum_5.astype(float) / (vol_roll_mean_30.astype(float) * 5.0)
-    # Compute alpha101-style rolling volume/amount levels and dispersions.
-    merged["vol_roll_mean_10"] = grp["Vol"].rolling(window=10, min_periods=10).mean().reset_index(level=0, drop=True).to_numpy(dtype=float)
-    merged["vol_roll_std_10"] = grp["Vol"].rolling(window=10, min_periods=10).std().reset_index(level=0, drop=True).to_numpy(dtype=float)
-    merged["vol_roll_mean_60"] = grp["Vol"].rolling(window=60, min_periods=60).mean().reset_index(level=0, drop=True).to_numpy(dtype=float)
-    merged["vol_roll_std_60"] = grp["Vol"].rolling(window=60, min_periods=60).std().reset_index(level=0, drop=True).to_numpy(dtype=float)
-    merged["amt_roll_mean_10"] = grp["Amount"].rolling(window=10, min_periods=10).mean().reset_index(level=0, drop=True).to_numpy(dtype=float)
-    merged["amt_roll_std_10"] = grp["Amount"].rolling(window=10, min_periods=10).std().reset_index(level=0, drop=True).to_numpy(dtype=float)
-    merged["amt_roll_mean_60"] = grp["Amount"].rolling(window=60, min_periods=60).mean().reset_index(level=0, drop=True).to_numpy(dtype=float)
-    merged["amt_roll_std_60"] = grp["Amount"].rolling(window=60, min_periods=60).std().reset_index(level=0, drop=True).to_numpy(dtype=float)
-    merged = merged.replace([np.inf, -np.inf], np.nan)
-
-    # Compute price-volume relation features using only past information.
-    cum_vol = grp["Vol"].cumsum()
-    cum_amt = grp["Amount"].cumsum()
-    vwap = cum_amt.astype(float) / cum_vol.astype(float)
-    merged["vwap_dev"] = (merged["Close"].astype(float) - vwap.astype(float)) / vwap.astype(float)
-    high_so_far = grp["High"].cummax().astype(float)
-    low_so_far = grp["Low"].cummin().astype(float)
-    merged["price_high_dev"] = (merged["Close"].astype(float) - high_so_far) / high_so_far
-    merged["price_low_dev"] = (merged["Close"].astype(float) - low_so_far) / low_so_far
-    corr_window = 30
-    amount_ret_corr = grp.apply(
-        lambda part: part["Amount"].rolling(window=corr_window, min_periods=corr_window).corr(part["ret_1"]),
-        include_groups=False,
-    )
-    amount_ret_corr = amount_ret_corr.reset_index(level=0, drop=True)
-    merged["amount_ret_corr"] = amount_ret_corr.astype(float)
-    merged = merged.replace([np.inf, -np.inf], np.nan)
-
-    # Compute volatility features from rolling return dispersion and OHLC range.
-    merged["volatility_10"] = grp["ret_1"].rolling(window=10, min_periods=10).std().reset_index(level=0, drop=True).to_numpy(dtype=float)
-    # Compute extra alpha101-style volatility horizons.
-    merged["volatility_20"] = grp["ret_1"].rolling(window=20, min_periods=20).std().reset_index(level=0, drop=True).to_numpy(dtype=float)
-    merged["volatility_30"] = grp["ret_1"].rolling(window=30, min_periods=30).std().reset_index(level=0, drop=True).to_numpy(dtype=float)
-    merged["volatility_60"] = grp["ret_1"].rolling(window=60, min_periods=60).std().reset_index(level=0, drop=True).to_numpy(dtype=float)
-    range_window = 30
-    win_high = grp["High"].rolling(window=range_window, min_periods=range_window).max().reset_index(level=0, drop=True)
-    win_low = grp["Low"].rolling(window=range_window, min_periods=range_window).min().reset_index(level=0, drop=True)
-    open_start = grp["Open"].shift(range_window - 1).astype(float)
-    merged["high_low_range"] = (win_high.astype(float) - win_low.astype(float)) / open_start
-    merged = merged.replace([np.inf, -np.inf], np.nan)
-
-    # Compute alpha101-style price-position and candle-shape features.
-    win_high_10 = grp["High"].rolling(window=10, min_periods=10).max().reset_index(level=0, drop=True)
-    win_low_10 = grp["Low"].rolling(window=10, min_periods=10).min().reset_index(level=0, drop=True)
-    merged["price_pos_10"] = (merged["Close"].astype(float) - win_low_10.astype(float)) / (win_high_10.astype(float) - win_low_10.astype(float))
-    merged["price_pos_30"] = (merged["Close"].astype(float) - win_low.astype(float)) / (win_high.astype(float) - win_low.astype(float))
-    win_high_60 = grp["High"].rolling(window=60, min_periods=60).max().reset_index(level=0, drop=True)
-    win_low_60 = grp["Low"].rolling(window=60, min_periods=60).min().reset_index(level=0, drop=True)
-    merged["price_pos_60"] = (merged["Close"].astype(float) - win_low_60.astype(float)) / (win_high_60.astype(float) - win_low_60.astype(float))
-    merged["oc_ret_1"] = (merged["Close"].astype(float) - merged["Open"].astype(float)) / merged["Open"].astype(float)
-    merged["hl_spread_1"] = (merged["High"].astype(float) - merged["Low"].astype(float)) / merged["Open"].astype(float)
-    merged = merged.replace([np.inf, -np.inf], np.nan)
-
-    # Compute alpha101-style rolling correlations for simple price-volume effects.
-    merged["log_vol"] = np.log1p(merged["Vol"].astype(float))
-    merged["log_amt"] = np.log1p(merged["Amount"].astype(float))
-    corr_window2 = 20
-    # Rebuild groupby so newly added columns are visible to apply().
-    grp2 = merged.groupby("StockCode", sort=False)
-    corr_ret_log_vol = grp2.apply(
-        lambda part: part["ret_1"].rolling(window=corr_window2, min_periods=corr_window2).corr(part["log_vol"]),
-        include_groups=False,
-    )
-    corr_ret_log_amt = grp2.apply(
-        lambda part: part["ret_1"].rolling(window=corr_window2, min_periods=corr_window2).corr(part["log_amt"]),
-        include_groups=False,
-    )
-    merged["corr_ret_log_vol_20"] = corr_ret_log_vol.reset_index(level=0, drop=True).astype(float)
-    merged["corr_ret_log_amt_20"] = corr_ret_log_amt.reset_index(level=0, drop=True).astype(float)
-    merged = merged.replace([np.inf, -np.inf], np.nan)
-
-    # Compute alpha101-style VWAP momentum as a stable microstructure signal.
-    vwap_shift_10 = vwap.astype(float).groupby(merged["StockCode"]).shift(10)
-    merged["vwap_ret_10"] = vwap.astype(float) / vwap_shift_10.astype(float) - 1.0
-    merged = merged.replace([np.inf, -np.inf], np.nan)
-
-    # Drop intermediate columns to keep the day panel narrow.
-    merged = merged.drop(columns=["log_vol", "log_amt"])
-
-    # Enforce the "window contains suspension bar -> NaN" rule for window-based features.
-    invalid = invalid_bar.astype(int)
-    invalid_roll_2 = invalid.groupby(merged["StockCode"]).rolling(window=2, min_periods=2).sum().reset_index(level=0, drop=True)
-    invalid_roll_3 = invalid.groupby(merged["StockCode"]).rolling(window=3, min_periods=3).sum().reset_index(level=0, drop=True)
-    invalid_roll_6 = invalid.groupby(merged["StockCode"]).rolling(window=6, min_periods=6).sum().reset_index(level=0, drop=True)
-    invalid_roll_10 = invalid.groupby(merged["StockCode"]).rolling(window=10, min_periods=10).sum().reset_index(level=0, drop=True)
-    invalid_roll_11 = invalid.groupby(merged["StockCode"]).rolling(window=11, min_periods=11).sum().reset_index(level=0, drop=True)
-    invalid_roll_16 = invalid.groupby(merged["StockCode"]).rolling(window=16, min_periods=16).sum().reset_index(level=0, drop=True)
-    invalid_roll_21 = invalid.groupby(merged["StockCode"]).rolling(window=21, min_periods=21).sum().reset_index(level=0, drop=True)
-    invalid_roll_31 = invalid.groupby(merged["StockCode"]).rolling(window=31, min_periods=31).sum().reset_index(level=0, drop=True)
-    invalid_roll_60 = invalid.groupby(merged["StockCode"]).rolling(window=60, min_periods=60).sum().reset_index(level=0, drop=True)
-    invalid_roll_61 = invalid.groupby(merged["StockCode"]).rolling(window=61, min_periods=61).sum().reset_index(level=0, drop=True)
-    invalid_roll_121 = invalid.groupby(merged["StockCode"]).rolling(window=121, min_periods=121).sum().reset_index(level=0, drop=True)
-    merged.loc[invalid_roll_2.to_numpy() > 0, ["ret_1", "vol_change_1"]] = np.nan
-    merged.loc[invalid_roll_3.to_numpy() > 0, ["ret_2"]] = np.nan
-    merged.loc[invalid_roll_6.to_numpy() > 0, ["ret_5", "vol_change_5"]] = np.nan
-    merged.loc[invalid_roll_11.to_numpy() > 0, ["ret_10", "volatility_10"]] = np.nan
-    merged.loc[invalid_roll_16.to_numpy() > 0, ["ret_15"]] = np.nan
-    merged.loc[invalid_roll_21.to_numpy() > 0, ["ret_20", "volatility_20", "corr_ret_log_vol_20", "corr_ret_log_amt_20"]] = np.nan
-    merged.loc[invalid_roll_31.to_numpy() > 0, ["ret_30", "volatility_30", "high_low_range", "amount_ret_corr"]] = np.nan
-    merged.loc[invalid_roll_61.to_numpy() > 0, ["ret_60"]] = np.nan
-    merged.loc[invalid_roll_121.to_numpy() > 0, ["ret_120"]] = np.nan
-    merged.loc[invalid_roll_10.to_numpy() > 0, ["vol_roll_mean_10", "vol_roll_std_10", "amt_roll_mean_10", "amt_roll_std_10", "price_pos_10"]] = np.nan
-    merged.loc[invalid_roll_60.to_numpy() > 0, ["vol_roll_mean_60", "vol_roll_std_60", "amt_roll_mean_60", "amt_roll_std_60", "price_pos_60"]] = np.nan
-    merged.loc[invalid_roll_31.to_numpy() > 0, ["price_pos_30"]] = np.nan
-    merged.loc[invalid_roll_61.to_numpy() > 0, ["volatility_60"]] = np.nan
-    merged.loc[invalid_roll_11.to_numpy() > 0, ["vwap_ret_10"]] = np.nan
-    invalid_cum = invalid.groupby(merged["StockCode"]).cumsum()
-    merged.loc[invalid_cum.to_numpy() > 0, ["ret_open", "vwap_dev", "price_high_dev", "price_low_dev"]] = np.nan
-    merged.loc[invalid_cum.to_numpy() > 0, ["oc_ret_1", "hl_spread_1", "price_pos_10", "price_pos_30", "price_pos_60", "vwap_ret_10"]] = np.nan
-
-    # Compute time features without cross-sectional normalization.
-    merged["minute_of_day"] = merged["MinuteIndex"].astype(int)
-    merged["is_open_30min"] = (merged["MinuteIndex"].astype(int) < 30).astype(int)
-    merged["is_close_30min"] = (merged["MinuteIndex"].astype(int) >= 211).astype(int)
-
-    # Apply cross-sectional winsorize + rank normalization per minute for non-time features.
-    xs_cols = [
-        "ret_1",
-        "ret_2",
-        "ret_5",
-        "ret_10",
-        "ret_15",
-        "ret_20",
-        "ret_30",
-        "ret_60",
-        "ret_120",
-        "ret_open",
-        "vol_change_1",
-        "vol_change_5",
-        "vol_roll_mean_10",
-        "vol_roll_std_10",
-        "vol_roll_mean_60",
-        "vol_roll_std_60",
-        "amt_roll_mean_10",
-        "amt_roll_std_10",
-        "amt_roll_mean_60",
-        "amt_roll_std_60",
-        "vwap_dev",
-        "vwap_ret_10",
-        "price_high_dev",
-        "price_low_dev",
-        "amount_ret_corr",
-        "volatility_10",
-        "volatility_20",
-        "volatility_30",
-        "volatility_60",
-        "high_low_range",
-        "price_pos_10",
-        "price_pos_30",
-        "price_pos_60",
-        "oc_ret_1",
-        "hl_spread_1",
-        "corr_ret_log_vol_20",
-        "corr_ret_log_amt_20",
-    ]
-    bounds = merged.groupby("DateTime", sort=False)[xs_cols].quantile([0.01, 0.99]).reset_index()
-    bounds = bounds.rename(columns={"level_1": "q"})
-    lower = bounds.loc[bounds["q"] == 0.01].drop(columns=["q"]).set_index("DateTime")
-    upper = bounds.loc[bounds["q"] == 0.99].drop(columns=["q"]).set_index("DateTime")
-    lower = lower.rename(columns={c: f"{c}__lo" for c in xs_cols})
-    upper = upper.rename(columns={c: f"{c}__hi" for c in xs_cols})
-    merged = merged.merge(lower.reset_index(), on="DateTime", how="left")
-    merged = merged.merge(upper.reset_index(), on="DateTime", how="left")
-    for col in xs_cols:
-        merged[col] = merged[col].astype(float).clip(lower=merged[f"{col}__lo"].astype(float), upper=merged[f"{col}__hi"].astype(float))
-        merged[col] = merged.groupby("DateTime", sort=False)[col].rank(pct=True)
-    merged = merged.drop(columns=[f"{c}__lo" for c in xs_cols] + [f"{c}__hi" for c in xs_cols])
-
     # Compute stock forward return label aligned to time t.
-    close_future = grp["Close"].shift(-horizon_minutes)
+    close_future = grp["Close"].shift(-int(horizon_minutes))
     merged["label_stock_10m"] = close_future.astype(float) / merged["Close"].astype(float) - 1.0
 
-    # Pack into the standardized panel schema required by AGENTS.md.
+    # Pack into a standardized base panel schema for downstream factor builders.
     out = merged.loc[
         :,
         [
             "Date",
             "DateTime",
             "StockCode",
+            "MinuteIndex",
             "weight",
             "label_stock_10m",
-            "MinuteIndex",
-            "ret_1",
-            "ret_2",
-            "ret_5",
-            "ret_10",
-            "ret_15",
-            "ret_20",
-            "ret_30",
-            "ret_60",
-            "ret_120",
-            "ret_open",
-            "vol_change_1",
-            "vol_change_5",
-            "vol_roll_mean_10",
-            "vol_roll_std_10",
-            "vol_roll_mean_60",
-            "vol_roll_std_60",
-            "amt_roll_mean_10",
-            "amt_roll_std_10",
-            "amt_roll_mean_60",
-            "amt_roll_std_60",
-            "vwap_dev",
-            "vwap_ret_10",
-            "price_high_dev",
-            "price_low_dev",
-            "amount_ret_corr",
-            "volatility_10",
-            "volatility_20",
-            "volatility_30",
-            "volatility_60",
-            "high_low_range",
-            "price_pos_10",
-            "price_pos_30",
-            "price_pos_60",
-            "oc_ret_1",
-            "hl_spread_1",
-            "corr_ret_log_vol_20",
-            "corr_ret_log_amt_20",
-            "minute_of_day",
-            "is_open_30min",
-            "is_close_30min",
+            "Open",
+            "High",
+            "Low",
+            "Close",
+            "Vol",
+            "Amount",
+            "invalid_bar",
         ],
     ].copy()
     out = out.rename(columns={"Date": "date", "DateTime": "datetime", "StockCode": "stock_code"})
@@ -374,13 +176,16 @@ def load_or_build_stock_panel_day(
     weights: pd.DataFrame,
     stock1m_root: str,
     horizon_minutes: int,
-    cache_root: str,
+    base_cache_root: str,
+    feature_cache_root: str,
+    specs_root: str,
+    factor_set_name: str,
 ) -> pd.DataFrame:
     """Load cached stock panel day or build and cache it."""
 
-    # Decide cache file path.
-    ensure_dir(cache_root)
-    cache_path = os.path.join(cache_root, f"{date}.parquet")
+    # Decide cache file path for the feature panel.
+    ensure_dir(feature_cache_root)
+    cache_path = os.path.join(feature_cache_root, f"{date}.parquet")
 
     # Load from cache if available.
     if os.path.exists(cache_path):
@@ -388,13 +193,49 @@ def load_or_build_stock_panel_day(
         day["datetime"] = pd.to_datetime(day["datetime"]).astype("datetime64[us]")
         return day
 
-    # Build the day panel and cache it.
-    day = build_stock_panel_day(
+    # Load or build the base panel under its own cache.
+    base = load_or_build_stock_base_panel_day(
         date=date,
         weights=weights,
         stock1m_root=stock1m_root,
         horizon_minutes=horizon_minutes,
+        base_cache_root=base_cache_root,
     )
+
+    # Build the feature panel and attach split for downstream filters.
+    day = build_stock_feature_panel_day(
+        base_panel=base,
+        specs_root=specs_root,
+        factor_set_name=factor_set_name,
+    )
+    day["split"] = date_to_split(date=int(date))
+
+    # Cache the built panel as a single parquet file for repeated runs.
+    day.to_parquet(cache_path, index=False)
+    return day
+
+
+def load_or_build_stock_base_panel_day(
+    date: int,
+    weights: pd.DataFrame,
+    stock1m_root: str,
+    horizon_minutes: int,
+    base_cache_root: str,
+) -> pd.DataFrame:
+    """Load cached base panel day or build and cache it."""
+
+    # Decide base cache file path.
+    ensure_dir(base_cache_root)
+    cache_path = os.path.join(base_cache_root, f"{date}.parquet")
+
+    # Load from cache if available.
+    if os.path.exists(cache_path):
+        day = pd.read_parquet(cache_path)
+        day["datetime"] = pd.to_datetime(day["datetime"]).astype("datetime64[us]")
+        return day
+
+    # Build base panel day and cache it.
+    day = build_stock_base_panel_day(date=date, weights=weights, stock1m_root=stock1m_root, horizon_minutes=horizon_minutes)
     day.to_parquet(cache_path, index=False)
     return day
 
@@ -404,10 +245,18 @@ def write_stock_panel_parquet(
     weights: pd.DataFrame,
     stock1m_root: str,
     horizon_minutes: int,
-    cache_root: str,
+    base_cache_root: str,
+    feature_cache_root: str,
+    specs_root: str,
+    factor_set_name: str,
     out_path: str,
 ) -> dict:
     """Write stock_panel.parquet by streaming day panels into one parquet file."""
+
+    # Load factor set once so coverage diagnostics and feature list stay consistent.
+    registry = load_registry(specs_root=specs_root)
+    factor_set = registry.factor_sets[str(factor_set_name)]
+    feature_cols = list(factor_set.factors) + ["minute_of_day", "is_open_30min", "is_close_30min"]
 
     # Create the output parent directory.
     ensure_dir(os.path.dirname(out_path))
@@ -419,6 +268,7 @@ def write_stock_panel_parquet(
     # Stream day panels to one parquet file to avoid holding the full dataset in memory.
     writer: pq.ParquetWriter | None = None
     rows_written = 0
+    non_null_counts = {str(col): 0 for col in feature_cols}
     start_time = time.time()
     for idx, date in enumerate(dates):
         # Print periodic progress for long runs.
@@ -432,12 +282,20 @@ def write_stock_panel_parquet(
             weights=weights,
             stock1m_root=stock1m_root,
             horizon_minutes=horizon_minutes,
-            cache_root=cache_root,
+            base_cache_root=base_cache_root,
+            feature_cache_root=feature_cache_root,
+            specs_root=specs_root,
+            factor_set_name=factor_set_name,
         )
         day = day.loc[day["split"].isin(["train", "test"])].copy()
 
         # Drop rows with truncated labels due to horizon.
         day = day.dropna(subset=["label_stock_10m"])
+
+        # Update per-feature coverage counters for basic missingness diagnostics.
+        counts = day.loc[:, feature_cols].notna().sum().to_dict()
+        for col in feature_cols:
+            non_null_counts[str(col)] += int(counts[str(col)])
 
         # Initialize parquet writer with the first batch schema.
         table = pa.Table.from_pandas(day, preserve_index=False)
@@ -453,24 +311,7 @@ def write_stock_panel_parquet(
     writer.close()
 
     # Return basic metadata for downstream training code.
-    feature_cols = [
-        "ret_1",
-        "ret_5",
-        "ret_10",
-        "ret_30",
-        "ret_60",
-        "ret_open",
-        "vol_change_1",
-        "vol_change_5",
-        "vwap_dev",
-        "price_high_dev",
-        "price_low_dev",
-        "amount_ret_corr",
-        "volatility_10",
-        "volatility_30",
-        "high_low_range",
-        "minute_of_day",
-        "is_open_30min",
-        "is_close_30min",
+    feature_coverage = [
+        {"feature": str(col), "non_null_rate": float(non_null_counts[str(col)] / float(rows_written))} for col in feature_cols
     ]
-    return {"rows_written": rows_written, "feature_cols": feature_cols}
+    return {"rows_written": rows_written, "feature_cols": feature_cols, "feature_coverage": feature_coverage}

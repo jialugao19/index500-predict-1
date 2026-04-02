@@ -1,0 +1,14 @@
+name_en: alpha_055
+name_zh: Alpha#55
+formula: (-1 * correlation(rank(((close - ts_min(low, 12)) / (ts_max(high, 12) - ts_min(low,
+  12)))), rank(volume), 6))
+inputs:
+- Open
+- High
+- Low
+- Close
+- Vol
+- Amount
+tags:
+- stock
+- alpha101

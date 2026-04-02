@@ -1,0 +1,14 @@
+name_en: alpha_010
+name_zh: Alpha#10
+formula: 'rank(((0 < ts_min(delta(close, 1), 4)) ? delta(close, 1) : ((ts_max(delta(close,
+  1), 4) < 0) ? delta(close, 1) : (-1 * delta(close, 1)))))'
+inputs:
+- Open
+- High
+- Low
+- Close
+- Vol
+- Amount
+tags:
+- stock
+- alpha101

@@ -1,0 +1,6 @@
+name_en: amount_ret_corr
+name_zh: 成交额与1分钟收益率滚动相关
+formula: TS_CORR(AMOUNT, TS_RETURNS(CLOSE, 1, 1), 30)
+inputs: [Amount, Close]
+tags: [stock, microstructure]
+

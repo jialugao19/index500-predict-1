@@ -1,0 +1,14 @@
+name_en: alpha_035
+name_zh: Alpha#35
+formula: ((Ts_Rank(volume, 32) * (1 - Ts_Rank(((close + high) - low), 16))) * (1 -
+  Ts_Rank(returns, 32)))
+inputs:
+- Open
+- High
+- Low
+- Close
+- Vol
+- Amount
+tags:
+- stock
+- alpha101

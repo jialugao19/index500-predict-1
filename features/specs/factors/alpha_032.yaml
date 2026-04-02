@@ -1,0 +1,14 @@
+name_en: alpha_032
+name_zh: Alpha#32
+formula: (scale(((sum(close, 7) / 7) - close)) + (20 * scale(correlation(vwap, delay(close,
+  5), 230))))
+inputs:
+- Open
+- High
+- Low
+- Close
+- Vol
+- Amount
+tags:
+- stock
+- alpha101

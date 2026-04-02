@@ -1,0 +1,14 @@
+name_en: alpha_039
+name_zh: Alpha#39
+formula: ((-1 * rank((delta(close, 7) * (1 - rank(decay_linear((volume / adv20), 9))))))
+  * (1 + rank(sum(returns, 250))))
+inputs:
+- Open
+- High
+- Low
+- Close
+- Vol
+- Amount
+tags:
+- stock
+- alpha101

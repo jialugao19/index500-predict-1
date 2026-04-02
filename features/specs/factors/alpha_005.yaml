@@ -1,0 +1,13 @@
+name_en: alpha_005
+name_zh: Alpha#5
+formula: (rank((open - (sum(vwap, 10) / 10))) * (-1 * abs(rank((close - vwap)))))
+inputs:
+- Open
+- High
+- Low
+- Close
+- Vol
+- Amount
+tags:
+- stock
+- alpha101

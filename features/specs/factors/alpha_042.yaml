@@ -1,0 +1,13 @@
+name_en: alpha_042
+name_zh: Alpha#42
+formula: (rank((vwap - close)) / rank((vwap + close)))
+inputs:
+- Open
+- High
+- Low
+- Close
+- Vol
+- Amount
+tags:
+- stock
+- alpha101

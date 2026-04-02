@@ -1,0 +1,6 @@
+name_en: ret_5m
+name_zh: ETF 5分钟收益率
+formula: TS_RETURNS(CLOSE, 5, 1)
+inputs: [Close]
+tags: [etf, momentum]
+

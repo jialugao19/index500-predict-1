@@ -1,0 +1,6 @@
+name_en: high_low_range
+name_zh: 30分钟高低振幅(相对开盘)
+formula: (TS_MAX(HIGH, 30) - TS_MIN(LOW, 30)) / TS_DELAY(OPEN, 29)
+inputs: [High, Low, Open]
+tags: [stock, volatility]
+

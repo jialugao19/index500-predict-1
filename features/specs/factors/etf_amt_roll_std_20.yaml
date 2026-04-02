@@ -1,0 +1,6 @@
+name_en: amt_roll_std_20
+name_zh: ETF 20分钟成交额标准差
+formula: TS_STD(AMOUNT, 20)
+inputs: [Amount]
+tags: [etf, liquidity]
+

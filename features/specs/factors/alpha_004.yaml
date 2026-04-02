@@ -1,0 +1,13 @@
+name_en: alpha_004
+name_zh: Alpha#4
+formula: (-1 * Ts_Rank(rank(low), 9))
+inputs:
+- Open
+- High
+- Low
+- Close
+- Vol
+- Amount
+tags:
+- stock
+- alpha101

@@ -1,0 +1,15 @@
+name_en: alpha_021
+name_zh: Alpha#21
+formula: '((((sum(close, 8) / 8) + stddev(close, 8)) < (sum(close, 2) / 2)) ? (-1
+  * 1) : (((sum(close, 2) / 2) < ((sum(close, 8) / 8) - stddev(close, 8))) ? 1 : (((1
+  < (volume / adv20)) || ((volume / adv20) == 1)) ? 1 : (-1 * 1))))'
+inputs:
+- Open
+- High
+- Low
+- Close
+- Vol
+- Amount
+tags:
+- stock
+- alpha101

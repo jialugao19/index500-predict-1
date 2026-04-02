@@ -1,0 +1,17 @@
+name: etf_default
+scope: etf
+factors:
+  - ret_1m
+  - ret_5m
+  - ret_10m
+  - ret_30m
+  - amt_chg_1m
+  - rv_10
+  - rv_20
+  - vol_roll_mean_20
+  - vol_roll_std_20
+  - amt_roll_mean_20
+  - amt_roll_std_20
+xs_clip_rank_factors: []
+invalid_after_first_invalid_factors: []
+

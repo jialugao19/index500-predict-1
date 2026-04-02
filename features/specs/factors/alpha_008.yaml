@@ -1,0 +1,14 @@
+name_en: alpha_008
+name_zh: Alpha#8
+formula: (-1 * rank(((sum(open, 5) * sum(returns, 5)) - delay((sum(open, 5) * sum(returns,
+  5)), 10))))
+inputs:
+- Open
+- High
+- Low
+- Close
+- Vol
+- Amount
+tags:
+- stock
+- alpha101
