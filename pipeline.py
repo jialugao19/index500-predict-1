@@ -30,6 +30,13 @@ from eval.walk_forward import run_walk_forward_validation
 from features.builders.etf import build_etf_features_day
 from features.etf import compute_label_from_close
 from models.lgbm import fit_lgbm_model
+from models.zscore import (
+    fit_frame_zscore_stats,
+    fit_series_zscore_stats,
+    inverse_series_zscore,
+    transform_frame_zscore,
+    transform_series_zscore,
+)
 from models.xgb import fit_xgb_model
 from eval.plots import (
     plot_baseline_comparison,
@@ -52,9 +59,10 @@ from eval.writers import (
 )
 from basket_aggregator import aggregate_day_to_basket
 from stock_panel_loader import (
+    get_stock_feature_cols,
     load_index_weights,
     load_or_build_stock_panel_day,
-    write_stock_panel_parquet,
+    prebuild_stock_feature_cache,
 )
 
 
@@ -256,9 +264,11 @@ def collect_stock_training_sample(
         day = day.dropna(subset=["label_stock_10m"])
 
         # Build a deterministic hash-based sample mask for reproducibility.
-        key = day["date"].astype(np.int64) * 1_000_000_000 + day["stock_code"].astype(np.int64) * 10_000 + day[
-            "MinuteIndex"
-        ].astype(np.int64)
+        key = (
+            day["date"].astype(np.int64) * 1_000_003
+            + day["stock_code"].astype(np.int64) * 10_007
+            + day["MinuteIndex"].astype(np.int64) * 10_009
+        )
         mask = (key % int(sample_mod)).astype(int) == 0
         sampled = day.loc[mask, ["date", "stock_code", "MinuteIndex", "label_stock_10m"] + feature_cols].copy()
         pieces.append(sampled)
@@ -362,11 +372,12 @@ def main() -> None:
     weight_path = "/data/ashare/market/index_weight/000905.feather"
     etf1m_root = "/data/ashare/market/etf1m"
     stock1m_root = "/data/ashare/market/stock1m"
-    factor_set_name = "stock_default"
-    etf_factor_set_name = "etf_default"
+    factor_set_name = "stock_all"
+    etf_factor_set_name = "etf_all"
+    stock_cache_jobs = 8
     specs_root = os.path.join(repo_root, "features", "specs")
     stock_panel_base_cache_root = f"/data-cache/index500-predict/stock_base_days_v1__h{label_horizon_minutes}"
-    stock_panel_feature_cache_root = f"/data-cache/index500-predict/stock_feature_days_v1__{factor_set_name}__h{label_horizon_minutes}"
+    stock_panel_feature_cache_root = f"/data-cache/index500-predict/stock_feature_days_v2__{factor_set_name}__h{label_horizon_minutes}"
     # Create output run directory under repo report folder grouped by month-day for easy browsing.
     now = dt.datetime.now()
     day_tag = now.strftime("%m%d")
@@ -383,9 +394,8 @@ def main() -> None:
     train_dates = filter_dates_by_range(all_dates=all_dates, start_date=train_start, end_date=train_end)
     test_dates = filter_dates_by_range(all_dates=all_dates, start_date=test_start, end_date=test_end)
 
-    # Bound the number of train days used for fitting to keep the end-to-end run time reasonable.
-    max_train_days_for_fit = 200
-    train_dates = train_dates[-int(max_train_days_for_fit) :]
+    # Use the full training date range as requested (2021-01-01 ~ 2023-12-31).
+    train_dates = list(train_dates)
     dates_needed = list(train_dates) + list(test_dates)
     print(f"[INFO] Available dates={len(all_dates)}, using train_dates={len(train_dates)}, test_dates={len(test_dates)}.")
 
@@ -395,26 +405,27 @@ def main() -> None:
         f"[INFO] Loaded weights rows={len(weights)}. trade_date_min={weights['trade_date'].min()} trade_date_max={weights['trade_date'].max()}."
     )
 
-    # Stage 1: Build stock panel parquet (test split deliverable).
-    stock_panel_path = os.path.join(report_dir, "stock_panel.parquet")
-    stock_panel_meta = write_stock_panel_parquet(
-        dates=list(test_dates),
-        weights=weights,
+    # Stage 1: Prebuild stock feature caches before training and evaluation.
+    cache_prebuild = prebuild_stock_feature_cache(
+        dates=dates_needed,
+        weight_path=weight_path,
         stock1m_root=stock1m_root,
         horizon_minutes=label_horizon_minutes,
         base_cache_root=stock_panel_base_cache_root,
         feature_cache_root=stock_panel_feature_cache_root,
         specs_root=specs_root,
         factor_set_name=factor_set_name,
-        out_path=stock_panel_path,
+        n_jobs=stock_cache_jobs,
     )
-    stock_feature_cols = stock_panel_meta["feature_cols"]
-    print(f"[INFO] Stock panel rows_written={int(stock_panel_meta['rows_written'])}.")
+    stock_feature_cols = get_stock_feature_cols(specs_root=specs_root, factor_set_name=factor_set_name)
+    print(
+        f"[INFO] Stock cache prebuild days={int(cache_prebuild['days'])} hits={int(cache_prebuild['cache_hits'])} misses={int(cache_prebuild['cache_misses'])}."
+    )
 
     # Write factor manifest for provenance and future factor-set driven training.
     registry = cached_load_registry(specs_root=specs_root)
     stock_manifest = build_factor_set_manifest(registry=registry, factor_set_name=factor_set_name)
-    stock_manifest["coverage"] = stock_panel_meta["feature_coverage"]
+    stock_manifest["cache_prebuild"] = cache_prebuild
     etf_manifest = build_factor_set_manifest(registry=registry, factor_set_name=etf_factor_set_name)
     write_yaml(path=os.path.join(report_dir, "feature_manifest.yaml"), obj={"stock": stock_manifest, "etf": etf_manifest})
 
@@ -438,6 +449,14 @@ def main() -> None:
     val = train_sample.loc[train_sample["month"] == val_month].copy()
     train_fit = train_sample.loc[train_sample["month"] < val_month].copy()
     print(f"[INFO] Stock train_fit rows={len(train_fit)}, val rows={len(val)} (sampled).")
+
+    # Stage 2: Fit feature/label z-score statistics on the true training fold only.
+    stock_feature_stats = fit_frame_zscore_stats(frame=train_fit, columns=stock_feature_cols)
+    stock_label_stats = fit_series_zscore_stats(series=train_fit["label"], name="label_stock_10m")
+    train_fit = transform_frame_zscore(frame=train_fit, stats=stock_feature_stats)
+    val = transform_frame_zscore(frame=val, stats=stock_feature_stats)
+    train_fit["label"] = transform_series_zscore(series=train_fit["label"], stats=stock_label_stats)
+    val["label"] = transform_series_zscore(series=val["label"], stats=stock_label_stats)
 
     # Stage 2: Train the required XGBoost + LightGBM unified panel models.
     stock_xgb_model = fit_xgb_model(train=train_fit, val=val, features=stock_feature_cols, seed=seed)
@@ -484,8 +503,11 @@ def main() -> None:
         day = day.dropna(subset=["label_stock_10m"])
 
         # Predict stock returns with the panel XGB model.
-        xgb_pred = stock_xgb_model.predict(day[stock_feature_cols].to_numpy())
-        lgbm_pred = stock_lgbm_model.predict(day[stock_feature_cols].to_numpy())
+        day_features = transform_frame_zscore(frame=day.loc[:, stock_feature_cols], stats=stock_feature_stats)
+        xgb_pred_z = stock_xgb_model.predict(day_features.to_numpy())
+        lgbm_pred_z = stock_lgbm_model.predict(day_features.to_numpy())
+        xgb_pred = inverse_series_zscore(values=xgb_pred_z, stats=stock_label_stats)
+        lgbm_pred = inverse_series_zscore(values=lgbm_pred_z, stats=stock_label_stats)
 
         # Compute stock-level panel IC tables for the test split only.
         if str(day["split"].iloc[0]) == "test":
@@ -880,9 +902,13 @@ def main() -> None:
     write_yaml(os.path.join(report_dir, "metrics.yaml"), metrics)
     write_bottom_up_report_md(report_dir=report_dir, run_id=run_id, metrics=metrics)
 
+    # Stage 5: Remove the deprecated stock-panel symlink from earlier runs.
+    deprecated_stock_panel_path = os.path.join(repo_root, "stock_panel.parquet")
+    if os.path.islink(deprecated_stock_panel_path) or os.path.exists(deprecated_stock_panel_path):
+        os.remove(deprecated_stock_panel_path)
+
     # Stage 5: Create stable top-level deliverable links for the caller.
     for name, target in [
-        ("stock_panel.parquet", stock_panel_path),
         ("basket_pred.parquet", basket_pred_path),
     ]:
         out_path = os.path.join(repo_root, name)

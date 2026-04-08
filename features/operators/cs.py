@@ -64,6 +64,32 @@ def indneutralize(x: pd.DataFrame, g: pd.Series) -> pd.DataFrame:
     return as_float_frame(out)
 
 
+def safe_div(a: pd.DataFrame | float, b: pd.DataFrame | float) -> pd.DataFrame:
+    """Compute SAFE_DIV(A, B) with zero or non-finite denominators mapped to NaN."""
+
+    # Broadcast scalar inputs into a DataFrame so output shape is explicit.
+    aa = a
+    bb = b
+    if not isinstance(aa, pd.DataFrame) and isinstance(bb, pd.DataFrame):
+        aa = pd.DataFrame(float(aa), index=bb.index, columns=bb.columns)
+    if not isinstance(bb, pd.DataFrame) and isinstance(aa, pd.DataFrame):
+        bb = pd.DataFrame(float(bb), index=aa.index, columns=aa.columns)
+
+    # Align frames and compute a nan-preserving guarded division.
+    if isinstance(aa, pd.DataFrame) and isinstance(bb, pd.DataFrame):
+        aa2, bb2 = aa.align(bb, join="inner", axis=1)
+        aa2, bb2 = aa2.align(bb2, join="inner", axis=0)
+        num = aa2.to_numpy(dtype=np.float64, copy=False)
+        den = bb2.to_numpy(dtype=np.float64, copy=False)
+        out = np.full_like(num, np.nan)
+        ok = np.isfinite(num) & np.isfinite(den) & (den != 0.0)
+        np.divide(num, den, out=out, where=ok)
+        return pd.DataFrame(out, index=aa2.index, columns=aa2.columns)
+
+    # Fail fast when neither input is a DataFrame, as specs should return frames.
+    raise TypeError("SAFE_DIV expects at least one DataFrame input in this task.")
+
+
 def minimum(a: pd.DataFrame | float, b: pd.DataFrame | float) -> pd.DataFrame:
     """Compute MIN(A, B) elementwise with DataFrame/scalar broadcasting."""
 
@@ -75,11 +101,11 @@ def minimum(a: pd.DataFrame | float, b: pd.DataFrame | float) -> pd.DataFrame:
     if not isinstance(bb, pd.DataFrame) and isinstance(aa, pd.DataFrame):
         bb = pd.DataFrame(float(bb), index=aa.index, columns=aa.columns)
 
-    # Align frames and compute elementwise minimum via numpy for speed.
+    # Align frames and compute elementwise minimum with nan-aware semantics.
     if isinstance(aa, pd.DataFrame) and isinstance(bb, pd.DataFrame):
         aa2, bb2 = aa.align(bb, join="inner", axis=1)
         aa2, bb2 = aa2.align(bb2, join="inner", axis=0)
-        out = np.minimum(aa2.to_numpy(dtype=np.float64, copy=False), bb2.to_numpy(dtype=np.float64, copy=False))
+        out = np.fmin(aa2.to_numpy(dtype=np.float64, copy=False), bb2.to_numpy(dtype=np.float64, copy=False))
         return pd.DataFrame(out, index=aa2.index, columns=aa2.columns)
 
     # Fail fast when neither input is a DataFrame, as specs should return frames.
@@ -97,11 +123,11 @@ def maximum(a: pd.DataFrame | float, b: pd.DataFrame | float) -> pd.DataFrame:
     if not isinstance(bb, pd.DataFrame) and isinstance(aa, pd.DataFrame):
         bb = pd.DataFrame(float(bb), index=aa.index, columns=aa.columns)
 
-    # Align frames and compute elementwise maximum via numpy for speed.
+    # Align frames and compute elementwise maximum with nan-aware semantics.
     if isinstance(aa, pd.DataFrame) and isinstance(bb, pd.DataFrame):
         aa2, bb2 = aa.align(bb, join="inner", axis=1)
         aa2, bb2 = aa2.align(bb2, join="inner", axis=0)
-        out = np.maximum(aa2.to_numpy(dtype=np.float64, copy=False), bb2.to_numpy(dtype=np.float64, copy=False))
+        out = np.fmax(aa2.to_numpy(dtype=np.float64, copy=False), bb2.to_numpy(dtype=np.float64, copy=False))
         return pd.DataFrame(out, index=aa2.index, columns=aa2.columns)
 
     # Fail fast when neither input is a DataFrame, as specs should return frames.

@@ -1,7 +1,7 @@
 name_en: alpha_083
 name_zh: Alpha#83
-formula: ((rank(delay(((high - low) / (sum(close, 5) / 5)), 2)) * rank(rank(volume)))
-  / (((high - low) / (sum(close, 5) / 5)) / (vwap - close)))
+formula: safe_div((rank(delay(safe_div((high - low), (sum(close, 5) / 5)), 2)) * rank(rank(volume))),
+  safe_div(safe_div((high - low), (sum(close, 5) / 5)), (vwap - close)))
 inputs:
 - Open
 - High

@@ -6,7 +6,6 @@ factors: &id001
 - alpha_003
 - alpha_004
 - alpha_005
-- alpha_006
 - alpha_007
 - alpha_008
 - alpha_009
@@ -14,7 +13,6 @@ factors: &id001
 - alpha_011
 - alpha_012
 - alpha_013
-- alpha_014
 - alpha_015
 - alpha_016
 - alpha_017
@@ -49,7 +47,6 @@ factors: &id001
 - alpha_046
 - alpha_047
 - alpha_049
-- alpha_050
 - alpha_051
 - alpha_052
 - alpha_053
@@ -64,12 +61,10 @@ factors: &id001
 - alpha_066
 - alpha_068
 - alpha_071
-- alpha_072
 - alpha_073
 - alpha_074
 - alpha_075
 - alpha_077
-- alpha_078
 - alpha_081
 - alpha_083
 - alpha_084
@@ -79,9 +74,15 @@ factors: &id001
 - alpha_092
 - alpha_094
 - alpha_095
-- alpha_096
 - alpha_098
 - alpha_099
-- alpha_101
-xs_clip_rank_factors: []
+xs_clip_rank_factors:
+  - alpha_084
+  - alpha_083
+  - alpha_057
+  - alpha_053
+  - alpha_042
+  - alpha_041
+  - alpha_024
+  - alpha_019
 invalid_after_first_invalid_factors: *id001
