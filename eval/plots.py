@@ -91,6 +91,34 @@ def plot_prediction_timeseries(pred_table: pd.DataFrame, model_name: str, out_pa
     plt.close()
 
 
+def plot_etf_backtest_compare(pred_table: pd.DataFrame, model_name: str, out_path: str) -> None:
+    """Plot a simple ETF backtest comparison curve on the test split."""
+
+    # Filter to the selected model and test split, then sort by timestamp.
+    part = pred_table.loc[(pred_table["model_name"] == model_name) & (pred_table["split"] == "test")].copy()
+    part = part.sort_values("datetime", ascending=True)
+
+    # Build the minute-level realized returns and a sign(pred) long-short strategy return.
+    pred = part["pred"].to_numpy(dtype=float)
+    label = part["label"].to_numpy(dtype=float)
+    pos = np.sign(pred)
+    strat_ret = pos * label
+
+    # Convert into cumulative curves starting from 1.0.
+    bench_curve = np.cumprod(1.0 + label)
+    strat_curve = np.cumprod(1.0 + strat_ret)
+
+    # Plot the cumulative curves for quick backtest diagnostics.
+    plt.figure(figsize=(12, 4))
+    plt.plot(part["datetime"], bench_curve, label="Benchmark: long ETF (cum)", linewidth=1.1)
+    plt.plot(part["datetime"], strat_curve, label="Strategy: sign(pred)*label (cum)", linewidth=1.1)
+    plt.title(f"ETF Backtest Compare ({model_name}, test)")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(out_path)
+    plt.close()
+
+
 def plot_feature_importance(importances: list[dict], out_path: str, top_k: int, title: str) -> None:
     """Plot a horizontal bar chart of top-K feature importances."""
 

@@ -1,4 +1,5 @@
 import os
+import base64
 
 import numpy as np
 import pandas as pd
@@ -413,32 +414,40 @@ def write_bottom_up_report_md(report_dir: str, run_id: str, metrics: dict) -> No
     lines.append("")
     stock = metrics["stock_alpha"]
     if "overall" in stock:
-        lines.append("- Stock panel IC (test, mean over minutes):")
+        lines.append("- Stock pooled TS-IC (test):")
+        for model_name in sorted(stock["overall"].keys()):
+            row = stock["overall"][model_name]
+            lines.append(
+                f"  - {model_name}: IC={float(row['ts_ic_test']):.6f}, RankIC={float(row['ts_rank_ic_test']):.6f}, n={int(row['ts_n_test'])}."
+            )
+        lines.append("- Stock daily TS-IC (test, mean over days):")
+        for model_name in sorted(stock["overall"].keys()):
+            row = stock["overall"][model_name]
+            lines.append(
+                f"  - {model_name}: IC={float(row['daily_ts_ic_test_mean']):.6f}, RankIC={float(row['daily_ts_rank_ic_test_mean']):.6f}, "
+                f"ICIR={float(row['daily_ts_icir_test']):.3f}, RankICIR={float(row['daily_ts_rank_icir_test']):.3f}."
+            )
+        lines.append("- Stock panel IC (test, mean over minutes, diagnostic):")
         for model_name in sorted(stock["overall"].keys()):
             row = stock["overall"][model_name]
             lines.append(
                 f"  - {model_name}: IC={float(row['panel_ic_test_mean']):.6f}, RankIC={float(row['panel_rank_ic_test_mean']):.6f}."
             )
-        lines.append("- Stock daily IC (test, mean over days):")
-        for model_name in sorted(stock["overall"].keys()):
-            row = stock["overall"][model_name]
-            lines.append(
-                f"  - {model_name}: IC={float(row['daily_ic_test_mean']):.6f}, RankIC={float(row['daily_rank_ic_test_mean']):.6f}, "
-                f"ICIR={float(row['daily_icir_test']):.3f}, RankICIR={float(row['daily_rank_icir_test']):.3f}."
-            )
     if "overall" in stock:
         lines.append("")
         lines.append("### Stock 模型对比 (test)")
         lines.append("")
-        lines.append("| model | panel_ic_mean | panel_rank_ic_mean | daily_ic_mean | daily_rank_ic_mean | daily_icir | daily_rank_icir |")
-        lines.append("| --- | --- | --- | --- | --- | --- | --- |")
+        lines.append("| model | ts_ic | ts_rank_ic | daily_ts_ic_mean | daily_ts_rank_ic_mean | daily_ts_icir | daily_ts_rank_icir | panel_ic_mean | panel_rank_ic_mean |")
+        lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- |")
         for model_name in sorted(stock["overall"].keys()):
             row = stock["overall"][model_name]
             lines.append(
-                f"| {model_name} | {float(row['panel_ic_test_mean']):.6f} | {float(row['panel_rank_ic_test_mean']):.6f} | {float(row['daily_ic_test_mean']):.6f} | {float(row['daily_rank_ic_test_mean']):.6f} | {float(row['daily_icir_test']):.3f} | {float(row['daily_rank_icir_test']):.3f} |"
+                f"| {model_name} | {float(row['ts_ic_test']):.6f} | {float(row['ts_rank_ic_test']):.6f} | "
+                f"{float(row['daily_ts_ic_test_mean']):.6f} | {float(row['daily_ts_rank_ic_test_mean']):.6f} | "
+                f"{float(row['daily_ts_icir_test']):.3f} | {float(row['daily_ts_rank_icir_test']):.3f} | "
+                f"{float(row['panel_ic_test_mean']):.6f} | {float(row['panel_rank_ic_test_mean']):.6f} |"
             )
-    lines.append("")
-    lines.append("### 分钟 Bucket IC (test)")
+    lines.append("### 分钟 Bucket IC (test, panel diagnostic)")
     lines.append("")
     lines.append("| minute_bucket | ic_mean | rank_ic_mean | minutes | n_sum |")
     lines.append("| --- | --- | --- | --- | --- |")
@@ -582,6 +591,183 @@ def write_bottom_up_report_md(report_dir: str, run_id: str, metrics: dict) -> No
 
     # Write to file.
     out_path = os.path.join(report_dir, "report.md")
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+
+def write_bottom_up_report_html(report_dir: str, run_id: str, metrics: dict) -> None:
+    """Write a self-contained HTML report for the bottom-up synthesis pipeline."""
+
+    # Encode a local file into base64 so the HTML can be fully self-contained.
+    def _file_to_data_uri(path: str, mime: str) -> str:
+        """Convert a local file into a base64 data URI string."""
+
+        # Read bytes and return as a data URI without any external dependencies.
+        with open(path, "rb") as f:
+            payload = base64.b64encode(f.read()).decode("ascii")
+        return f"data:{mime};base64,{payload}"
+
+    # Render a simple HTML table from list-of-dicts rows.
+    def _table(rows: list[dict], cols: list[str]) -> str:
+        """Render an HTML table for the report."""
+
+        # Emit table header and body rows with numeric formatting.
+        head = "".join([f"<th>{c}</th>" for c in cols])
+        body: list[str] = []
+        for row in rows:
+            tds: list[str] = []
+            for c in cols:
+                v = row.get(c, "")
+                if isinstance(v, float):
+                    tds.append(f"<td>{v:.6f}</td>")
+                else:
+                    tds.append(f"<td>{v}</td>")
+            body.append("<tr>" + "".join(tds) + "</tr>")
+        return "<table><thead><tr>" + head + "</tr></thead><tbody>" + "".join(body) + "</tbody></table>"
+
+    # Collect known image artifacts if they exist and embed them as data URIs.
+    img_candidates = [
+        ("Basket branch compare (test)", "fig_basket_branch_compare_test.png"),
+        ("ETF branch compare (test)", "fig_etf_branch_compare_test.png"),
+        ("Best daily IC (test)", "fig_best_daily_ic.png"),
+        ("Best cumulative IC (test)", "fig_best_cum_ic.png"),
+        ("Best monthly IC (test)", "fig_best_monthly_ic.png"),
+        ("ETF backtest compare (test)", "fig_etf_backtest_compare_test.png"),
+        ("Basis best daily IC (test)", "fig_basis_best_daily_ic.png"),
+        ("Synthetic vs real daily delta (test)", "fig_synth_vs_real_daily_delta_test.png"),
+    ]
+    embedded_imgs: list[dict] = []
+    for title, filename in img_candidates:
+        path = os.path.join(report_dir, filename)
+        if os.path.exists(path):
+            embedded_imgs.append({"title": str(title), "src": _file_to_data_uri(path=path, mime="image/png")})
+
+    # Assemble the key tables from metrics.yaml for the report.
+    cfg = metrics["config"]
+    stock_rows = []
+    for model_name in sorted(metrics["stock_alpha"]["overall"].keys()):
+        row = metrics["stock_alpha"]["overall"][model_name]
+        stock_rows.append(
+            {
+                "model": str(model_name),
+                "ts_ic": float(row["ts_ic_test"]),
+                "ts_rank_ic": float(row["ts_rank_ic_test"]),
+                "ts_n": int(row["ts_n_test"]),
+                "daily_ts_ic_mean": float(row["daily_ts_ic_test_mean"]),
+                "daily_ts_rank_ic_mean": float(row["daily_ts_rank_ic_test_mean"]),
+                "daily_ts_icir": float(row["daily_ts_icir_test"]),
+                "daily_ts_rank_icir": float(row["daily_ts_rank_icir_test"]),
+                "panel_ic_mean": float(row["panel_ic_test_mean"]),
+                "panel_rank_ic_mean": float(row["panel_rank_ic_test_mean"]),
+            }
+        )
+
+    basket_rows = []
+    for model_name in sorted(metrics["basket_synthesis"]["overall"].keys()):
+        row = metrics["basket_synthesis"]["overall"][model_name]["test"]
+        basket_rows.append(
+            {
+                "model": str(model_name),
+                "ic": float(row["ic"]),
+                "rank_ic": float(row["rank_ic"]),
+                "dir_acc": float(row["direction_acc"]),
+                "rmse": float(row["rmse"]),
+                "mae": float(row["mae"]),
+                "n": int(row["n"]),
+            }
+        )
+
+    basis_rows = []
+    if "basis_eval" in metrics:
+        for model_name in sorted(metrics["basis_eval"]["overall"].keys()):
+            row = metrics["basis_eval"]["overall"][model_name]["test"]
+            basis_rows.append(
+                {
+                    "model": str(model_name),
+                    "ic": float(row["ic"]),
+                    "rank_ic": float(row["rank_ic"]),
+                    "dir_acc": float(row["direction_acc"]),
+                    "rmse": float(row["rmse"]),
+                    "mae": float(row["mae"]),
+                    "n": int(row["n"]),
+                }
+            )
+
+    etf_rows = []
+    for model_name in sorted(metrics["etf_level"]["overall"].keys()):
+        row = metrics["etf_level"]["overall"][model_name]["test"]
+        etf_rows.append(
+            {
+                "model": str(model_name),
+                "ic": float(row["ic"]),
+                "rank_ic": float(row["rank_ic"]),
+                "dir_acc": float(row["direction_acc"]),
+                "rmse": float(row["rmse"]),
+                "mae": float(row["mae"]),
+                "n": int(row["n"]),
+            }
+        )
+
+    # Build HTML with inline CSS and embedded images.
+    css = """
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, "Noto Sans", sans-serif; margin: 20px; color: #111; }
+    h1, h2, h3 { margin: 0.8em 0 0.4em; }
+    .meta { background: #f6f8fa; padding: 12px 14px; border-radius: 8px; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+    .card { border: 1px solid #e5e7eb; border-radius: 10px; padding: 12px 14px; }
+    table { border-collapse: collapse; width: 100%; font-size: 12px; }
+    th, td { border-bottom: 1px solid #eee; padding: 6px 6px; text-align: right; }
+    th:first-child, td:first-child { text-align: left; }
+    th { position: sticky; top: 0; background: #fff; z-index: 1; }
+    .small { font-size: 12px; color: #444; }
+    code { background: #f3f4f6; padding: 1px 4px; border-radius: 4px; }
+    img { max-width: 100%; height: auto; border: 1px solid #eee; border-radius: 8px; }
+    """
+
+    lines: list[str] = []
+    lines.append("<!doctype html>")
+    lines.append("<html><head><meta charset='utf-8' />")
+    lines.append("<meta name='viewport' content='width=device-width, initial-scale=1' />")
+    lines.append(f"<title>Bottom-up Synthesis ({run_id})</title>")
+    lines.append(f"<style>{css}</style></head><body>")
+    lines.append(f"<h1>Bottom-up Synthesis 报告 ({run_id})</h1>")
+
+    lines.append("<div class='meta'>")
+    lines.append(f"<div class='small'>ETF: <code>{int(cfg['etf_code_int'])}</code>, horizon: <code>{int(cfg['label_horizon_minutes'])}</code> min.</div>")
+    lines.append(
+        f"<div class='small'>Train: <code>{int(cfg['train_range'][0])}</code>~<code>{int(cfg['train_range'][1])}</code> (days=<code>{int(cfg['used_train_days'])}</code>), "
+        f"Test: <code>{int(cfg['test_start'])}</code>~<code>{int(cfg['test_end'])}</code> (days=<code>{int(cfg['used_test_days'])}</code>).</div>"
+    )
+    lines.append("</div>")
+
+    lines.append("<h2>1. Stock Alpha (个股端, test)</h2>")
+    lines.append(_table(stock_rows, ["model", "ts_ic", "ts_rank_ic", "ts_n", "daily_ts_ic_mean", "daily_ts_rank_ic_mean", "daily_ts_icir", "daily_ts_rank_icir", "panel_ic_mean", "panel_rank_ic_mean"]))
+
+    lines.append("<h2>2. Basket Synthesis (合成端, test)</h2>")
+    lines.append(_table(basket_rows, ["model", "ic", "rank_ic", "dir_acc", "rmse", "mae", "n"]))
+
+    if len(basis_rows) > 0:
+        lines.append("<h2>3. Basis (Basket 预测 vs 真实 ETF, test)</h2>")
+        lines.append(_table(basis_rows, ["model", "ic", "rank_ic", "dir_acc", "rmse", "mae", "n"]))
+
+    lines.append("<h2>4. ETF Level (test)</h2>")
+    lines.append(_table(etf_rows, ["model", "ic", "rank_ic", "dir_acc", "rmse", "mae", "n"]))
+
+    if len(embedded_imgs) > 0:
+        lines.append("<h2>5. Figures</h2>")
+        lines.append("<div class='grid'>")
+        for item in embedded_imgs:
+            lines.append("<div class='card'>")
+            lines.append(f"<h3>{item['title']}</h3>")
+            lines.append(f"<img src='{item['src']}' />")
+            lines.append("</div>")
+        lines.append("</div>")
+
+    lines.append("<hr />")
+    lines.append("<div class='small'>Self-contained HTML; all images are embedded as base64.</div>")
+    lines.append("</body></html>")
+
+    out_path = os.path.join(report_dir, "report.html")
     with open(out_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
 

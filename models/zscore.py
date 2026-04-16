@@ -46,9 +46,14 @@ def fit_frame_zscore_stats(frame: pd.DataFrame, columns: list[str]) -> FrameZSco
 def transform_frame_zscore(frame: pd.DataFrame, stats: FrameZScoreStats) -> pd.DataFrame:
     """Apply fitted z-score statistics to a dataframe."""
 
-    # Standardize the requested columns with aligned pandas broadcasting.
+    # Copy the input frame to keep the transform side-effect free.
     out = frame.copy()
-    out.loc[:, stats.columns] = (out.loc[:, stats.columns].astype(float) - stats.mean).div(stats.std, axis=1)
+
+    # Cast standardized columns to float to avoid incompatible-dtype assignments.
+    out = out.astype({name: float for name in stats.columns})
+
+    # Standardize the requested columns with aligned pandas broadcasting.
+    out.loc[:, stats.columns] = (out.loc[:, stats.columns] - stats.mean).div(stats.std, axis=1)
     return out
 
 

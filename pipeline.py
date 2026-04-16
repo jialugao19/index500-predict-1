@@ -46,12 +46,14 @@ from eval.plots import (
     plot_monthly_timeseries,
     plot_prediction_scatter,
     plot_prediction_timeseries,
+    plot_etf_backtest_compare,
     plot_histogram,
 )
 from eval.writers import (
     compute_coverage_audit_tables,
     write_data_audit_md,
     write_bottom_up_report_md,
+    write_bottom_up_report_html,
     write_report_md,
     write_report_tex,
     write_summary_md,
@@ -355,25 +357,24 @@ def sample_spot_checks(
     return checks
 
 
-def main() -> None:
-    """Run the bottom-up synthesis pipeline for 510500."""
-
-    # Define core constants from AGENTS.md.
-    seed = 42
-    etf_code_int = 510500
-    label_horizon_minutes = 10
-    train_start = 20210101
-    train_end = 20231231
-    test_start = 20240201
-    test_end = 20251231
+def run_bottom_up_synthesis(
+    seed: int,
+    etf_code_int: int,
+    label_horizon_minutes: int,
+    train_start: int,
+    train_end: int,
+    test_start: int,
+    test_end: int,
+    factor_set_name: str,
+    etf_factor_set_name: str,
+) -> str:
+    """Run the bottom-up synthesis pipeline and return report_dir."""
 
     # Define data locations.
     repo_root = os.path.dirname(os.path.abspath(__file__))
     weight_path = "/data/ashare/market/index_weight/000905.feather"
     etf1m_root = "/data/ashare/market/etf1m"
     stock1m_root = "/data/ashare/market/stock1m"
-    factor_set_name = "stock_all"
-    etf_factor_set_name = "etf_all"
     stock_cache_jobs = 8
     specs_root = os.path.join(repo_root, "features", "specs")
     stock_panel_base_cache_root = f"/data-cache/index500-predict/stock_base_days_v1__h{label_horizon_minutes}"
@@ -486,6 +487,7 @@ def main() -> None:
     minute_ic_tables: dict[str, list[pd.DataFrame]] = {k: [] for k in ["xgb", "lgbm"]}
     stock_ts_stats_tables: list[pd.DataFrame] = []
     stock_daily_ic_tables: list[pd.DataFrame] = []
+    stock_ts_pred_tables: list[pd.DataFrame] = []
     basket_rows: list[pd.DataFrame] = []
     for date in dates_needed:
         # Load cached day panel and keep train/test rows only.
@@ -509,6 +511,32 @@ def main() -> None:
         xgb_pred = inverse_series_zscore(values=xgb_pred_z, stats=stock_label_stats)
         lgbm_pred = inverse_series_zscore(values=lgbm_pred_z, stats=stock_label_stats)
 
+        # Collect stock-level pooled time-series prediction rows for TS-IC evaluation.
+        stock_ts_pred_tables.append(
+            pd.DataFrame(
+                {
+                    'datetime': pd.to_datetime(day['datetime']).astype('datetime64[ns]'),
+                    'date': day['date'].astype(int),
+                    'pred': xgb_pred.astype(float),
+                    'label': day['label_stock_10m'].astype(float),
+                    'split': day['split'].astype(str),
+                    'model_name': 'xgb',
+                }
+            )
+        )
+        stock_ts_pred_tables.append(
+            pd.DataFrame(
+                {
+                    'datetime': pd.to_datetime(day['datetime']).astype('datetime64[ns]'),
+                    'date': day['date'].astype(int),
+                    'pred': lgbm_pred.astype(float),
+                    'label': day['label_stock_10m'].astype(float),
+                    'split': day['split'].astype(str),
+                    'model_name': 'lgbm',
+                }
+            )
+        )
+
         # Compute stock-level panel IC tables for the test split only.
         if str(day["split"].iloc[0]) == "test":
             minute_ic_tables["xgb"].append(compute_panel_ic_by_minute(day_panel=day, pred=xgb_pred, label_col="label_stock_10m"))
@@ -526,33 +554,47 @@ def main() -> None:
         basket_rows.append(pd.concat([basket_xgb, basket_lgbm], axis=0, ignore_index=True))
 
     # Stage 3: Evaluate Stock Alpha and write basket_pred.parquet (deliverable).
+    # Stage 3: Compute pooled stock TS-IC using the same compute_metrics convention as ETF.
+    stock_ts_pred_table = pd.concat(stock_ts_pred_tables, axis=0, ignore_index=True)
+    stock_ts_metrics = compute_metrics(pred_table=stock_ts_pred_table)
     stock_alpha_overall: dict[str, dict] = {}
     for model_name in ["xgb", "lgbm"]:
-        # Summarize pooled minute IC and daily IC for each stock model.
+        # Summarize pooled TS-IC and daily TS-IC statistics for each stock model.
+        ts_test = stock_ts_metrics["overall"][str(model_name)]["test"]
+        ts_daily = pd.DataFrame(stock_ts_metrics["daily"][str(model_name)]).copy()
+        ts_daily_ic_mean = float(ts_daily["ic"].mean())
+        ts_daily_rank_ic_mean = float(ts_daily["rank_ic"].mean())
+        ts_daily_ic_std = float(ts_daily["ic"].std())
+        ts_daily_rank_ic_std = float(ts_daily["rank_ic"].std())
+
+        # Summarize panel IC diagnostics (cross-sectional IC averaged across minutes).
         minute_ic = pd.concat(minute_ic_tables[model_name], axis=0, ignore_index=True)
-        daily_ic = summarize_panel_ic_daily(minute_ic=minute_ic)
-        daily_ic_mean = float(daily_ic["ic_mean"].mean())
-        daily_rank_ic_mean = float(daily_ic["rank_ic_mean"].mean())
-        daily_ic_std = float(daily_ic["ic_mean"].std())
-        daily_rank_ic_std = float(daily_ic["rank_ic_mean"].std())
         stock_alpha_overall[str(model_name)] = {
+            "ts_ic_test": float(ts_test["ic"]),
+            "ts_rank_ic_test": float(ts_test["rank_ic"]),
+            "ts_direction_acc_test": float(ts_test["direction_acc"]),
+            "ts_rmse_test": float(ts_test["rmse"]),
+            "ts_mae_test": float(ts_test["mae"]),
+            "ts_n_test": int(ts_test["n"]),
             "panel_ic_test_mean": float(minute_ic["ic"].mean()),
             "panel_rank_ic_test_mean": float(minute_ic["rank_ic"].mean()),
-            "daily_ic_test_mean": daily_ic_mean,
-            "daily_rank_ic_test_mean": daily_rank_ic_mean,
-            "daily_ic_test_std": daily_ic_std,
-            "daily_rank_ic_test_std": daily_rank_ic_std,
-            "daily_icir_test": float(daily_ic_mean / daily_ic_std),
-            "daily_rank_icir_test": float(daily_rank_ic_mean / daily_rank_ic_std),
+            "daily_ts_ic_test_mean": ts_daily_ic_mean,
+            "daily_ts_rank_ic_test_mean": ts_daily_rank_ic_mean,
+            "daily_ts_ic_test_std": ts_daily_ic_std,
+            "daily_ts_rank_ic_test_std": ts_daily_rank_ic_std,
+            "daily_ts_icir_test": float(ts_daily_ic_mean / ts_daily_ic_std),
+            "daily_ts_rank_icir_test": float(ts_daily_rank_ic_mean / ts_daily_rank_ic_std),
         }
     minute_ic_xgb = pd.concat(minute_ic_tables["xgb"], axis=0, ignore_index=True)
     bucket_ic = summarize_panel_ic_by_minute_bucket(minute_ic=minute_ic_xgb, bucket_size=30)
     bucket_ic["minute_bucket"] = bucket_ic["minute_bucket"].astype(int)
     stock_alpha_metrics = {
+        "ts_ic_test": float(stock_alpha_overall["xgb"]["ts_ic_test"]),
+        "ts_rank_ic_test": float(stock_alpha_overall["xgb"]["ts_rank_ic_test"]),
         "panel_ic_test_mean": float(stock_alpha_overall["xgb"]["panel_ic_test_mean"]),
         "panel_rank_ic_test_mean": float(stock_alpha_overall["xgb"]["panel_rank_ic_test_mean"]),
-        "daily_ic_test_mean": float(stock_alpha_overall["xgb"]["daily_ic_test_mean"]),
-        "daily_rank_ic_test_mean": float(stock_alpha_overall["xgb"]["daily_rank_ic_test_mean"]),
+        "daily_ts_ic_test_mean": float(stock_alpha_overall["xgb"]["daily_ts_ic_test_mean"]),
+        "daily_ts_rank_ic_test_mean": float(stock_alpha_overall["xgb"]["daily_ts_rank_ic_test_mean"]),
         "overall": stock_alpha_overall,
         "minute_bucket_ic_test": bucket_ic.to_dict(orient="records"),
         "feature_importance": {
@@ -565,7 +607,7 @@ def main() -> None:
     # Compute per-stock time-series metrics on the test split for stock-level diagnostics.
     stock_ts_stats = pd.concat(stock_ts_stats_tables, axis=0, ignore_index=True)
     stock_ts_stats_sum = stock_ts_stats.groupby("stock_code", sort=True).sum(numeric_only=True).reset_index()
-    stock_ts_metrics = finalize_stock_metrics_from_sufficient_stats(stats=stock_ts_stats_sum)
+    stock_per_stock_ts_metrics = finalize_stock_metrics_from_sufficient_stats(stats=stock_ts_stats_sum)
 
     # Compute per-stock within-day IC averages as a robustness cross-check.
     stock_daily_ic = pd.concat(stock_daily_ic_tables, axis=0, ignore_index=True)
@@ -582,7 +624,7 @@ def main() -> None:
     )
 
     # Merge minute-level and within-day summary tables to one per-stock evaluation table.
-    stock_metrics = stock_ts_metrics.merge(stock_daily_summary, on="stock_code", how="left")
+    stock_metrics = stock_per_stock_ts_metrics.merge(stock_daily_summary, on="stock_code", how="left")
 
     # Tag stocks as good/bad/neutral using an IC t-stat threshold.
     ic_t_threshold = 2.0
@@ -842,6 +884,13 @@ def main() -> None:
     best_model = pick_best_model_by_metric(etf_overall=etf_metrics["overall"], split="test", metric_name="rank_ic")
     best_row = etf_metrics["overall"][best_model]["test"]
 
+    # Stage 5: Plot a simple ETF backtest compare chart for the selected model on test.
+    plot_etf_backtest_compare(
+        pred_table=etf_pred_table,
+        model_name=best_model,
+        out_path=os.path.join(report_dir, "fig_etf_backtest_compare_test.png"),
+    )
+
     # Stage 5: Assemble one metrics.yaml for the full three-layer evaluation.
     metrics = {
         "config": {
@@ -901,6 +950,7 @@ def main() -> None:
     }
     write_yaml(os.path.join(report_dir, "metrics.yaml"), metrics)
     write_bottom_up_report_md(report_dir=report_dir, run_id=run_id, metrics=metrics)
+    write_bottom_up_report_html(report_dir=report_dir, run_id=run_id, metrics=metrics)
 
     # Stage 5: Remove the deprecated stock-panel symlink from earlier runs.
     deprecated_stock_panel_path = os.path.join(repo_root, "stock_panel.parquet")
@@ -944,7 +994,19 @@ def main() -> None:
 
     # Print final report directory for the caller.
     print(f"[INFO] Done. report_dir={report_dir}")
+    return str(report_dir)
 
 
 if __name__ == "__main__":
-    main()
+    # Define core constants from AGENTS.md.
+    report_dir = run_bottom_up_synthesis(
+        seed=42,
+        etf_code_int=510500,
+        label_horizon_minutes=10,
+        train_start=20210101,
+        train_end=20231231,
+        test_start=20240201,
+        test_end=20251231,
+        factor_set_name="stock_all",
+        etf_factor_set_name="etf_all",
+    )
