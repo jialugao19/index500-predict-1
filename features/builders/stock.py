@@ -217,6 +217,7 @@ def build_stock_feature_panel_day(
         "weight",
         "label_stock_10m",
         "MinuteIndex",
+        "Amount",
     ] + factor_names + ["minute_of_day", "is_open_30min", "is_close_30min"]
     out = base.loc[:, out_cols].copy()
     return out

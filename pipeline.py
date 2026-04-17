@@ -59,7 +59,7 @@ from eval.writers import (
     write_summary_md,
     write_yaml,
 )
-from basket_aggregator import aggregate_day_to_basket
+from basket_aggregator import aggregate_day_to_basket, aggregate_day_to_basket_variant
 from stock_panel_loader import (
     get_stock_feature_cols,
     load_index_weights,
@@ -367,6 +367,7 @@ def run_bottom_up_synthesis(
     test_end: int,
     factor_set_name: str,
     etf_factor_set_name: str,
+    basket_variants: list[dict],
 ) -> str:
     """Run the bottom-up synthesis pipeline and return report_dir."""
 
@@ -453,6 +454,7 @@ def run_bottom_up_synthesis(
 
     # Stage 2: Fit feature/label z-score statistics on the true training fold only.
     stock_feature_stats = fit_frame_zscore_stats(frame=train_fit, columns=stock_feature_cols)
+    stock_feature_cols = list(stock_feature_stats.columns)
     stock_label_stats = fit_series_zscore_stats(series=train_fit["label"], name="label_stock_10m")
     train_fit = transform_frame_zscore(frame=train_fit, stats=stock_feature_stats)
     val = transform_frame_zscore(frame=val, stats=stock_feature_stats)
@@ -552,6 +554,34 @@ def run_bottom_up_synthesis(
         basket_lgbm = aggregate_day_to_basket(stock_day=day, pred=lgbm_pred, pred_col_name="pred_stock_lgbm")
         basket_lgbm["model_name"] = "basket_stock_lgbm"
         basket_rows.append(pd.concat([basket_xgb, basket_lgbm], axis=0, ignore_index=True))
+
+        # Aggregate experimental basket variants for concentration diagnostics.
+        for spec in basket_variants:
+            # Parse variant parameters from the spec dict.
+            tag = str(spec["tag"])
+            top_k_by_weight = int(spec["top_k_by_weight"])
+            weight_mode = str(spec["weight_mode"])
+
+            # Aggregate variant baskets for both stock models.
+            basket_xgb_var = aggregate_day_to_basket_variant(
+                stock_day=day,
+                pred=xgb_pred,
+                pred_col_name="pred_stock_xgb",
+                label_col="label_stock_10m",
+                top_k_by_weight=top_k_by_weight,
+                weight_mode=weight_mode,
+            )
+            basket_xgb_var["model_name"] = f"basket_{tag}_stock_xgb"
+            basket_lgbm_var = aggregate_day_to_basket_variant(
+                stock_day=day,
+                pred=lgbm_pred,
+                pred_col_name="pred_stock_lgbm",
+                label_col="label_stock_10m",
+                top_k_by_weight=top_k_by_weight,
+                weight_mode=weight_mode,
+            )
+            basket_lgbm_var["model_name"] = f"basket_{tag}_stock_lgbm"
+            basket_rows.append(pd.concat([basket_xgb_var, basket_lgbm_var], axis=0, ignore_index=True))
 
     # Stage 3: Evaluate Stock Alpha and write basket_pred.parquet (deliverable).
     # Stage 3: Compute pooled stock TS-IC using the same compute_metrics convention as ETF.
@@ -854,10 +884,12 @@ def run_bottom_up_synthesis(
         title="Synthetic - Real ETF (Daily mean error, test)",
         out_path=os.path.join(report_dir, "fig_synth_vs_real_daily_delta_test.png"),
     )
-    basket_branches = {
-        "basket_stock_xgb": basket_all.loc[basket_all["model_name"] == "basket_stock_xgb", ["date", "datetime", "split", "basket_pred"]].copy(),
-        "basket_stock_lgbm": basket_all.loc[basket_all["model_name"] == "basket_stock_lgbm", ["date", "datetime", "split", "basket_pred"]].copy(),
-    }
+    basket_branches = {}
+    for model_name in sorted(basket_all["model_name"].astype(str).unique().tolist()):
+        basket_branches[str(model_name)] = basket_all.loc[
+            basket_all["model_name"].astype(str) == str(model_name),
+            ["date", "datetime", "split", "basket_pred"],
+        ].copy()
 
     # Stage 4: Build ETF prediction tables for all basket branches.
     etf_pred_tables: list[pd.DataFrame] = []
@@ -1009,4 +1041,5 @@ if __name__ == "__main__":
         test_end=20251231,
         factor_set_name="stock_all",
         etf_factor_set_name="etf_all",
+        basket_variants=[],
     )

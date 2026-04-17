@@ -284,8 +284,22 @@ def load_or_build_stock_panel_day(
 
     # Load from cache if available.
     if os.path.exists(cache_path):
+        # Read the cached feature panel with stable datetime dtype.
         day = pd.read_parquet(cache_path)
         day["datetime"] = pd.to_datetime(day["datetime"]).astype("datetime64[us]")
+
+        # Backfill Amount for legacy caches so amount-based basket weights can be computed.
+        if "Amount" not in day.columns:
+            base = load_or_build_stock_base_panel_day(
+                date=int(date),
+                weights=weights,
+                stock1m_root=stock1m_root,
+                horizon_minutes=int(horizon_minutes),
+                base_cache_root=base_cache_root,
+            )
+            base = base.loc[:, ["date", "datetime", "stock_code", "MinuteIndex", "Amount"]].copy()
+            base["datetime"] = pd.to_datetime(base["datetime"]).astype("datetime64[us]")
+            day = day.merge(base, on=["date", "datetime", "stock_code", "MinuteIndex"], how="left")
         return day
 
     # Load or build the base panel under its own cache.

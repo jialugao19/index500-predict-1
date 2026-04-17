@@ -34,13 +34,19 @@ def fit_frame_zscore_stats(frame: pd.DataFrame, columns: list[str]) -> FrameZSco
     mean = data.mean(axis=0, skipna=True)
     std = data.std(axis=0, skipna=True, ddof=0)
 
-    # Require finite training statistics for every column.
-    assert bool(np.isfinite(mean.to_numpy(dtype=float)).all())
-    assert bool(np.isfinite(std.to_numpy(dtype=float)).all())
-    assert bool((std.to_numpy(dtype=float) > 0.0).all())
+    # Keep only columns with finite, non-zero scales to make z-score well-defined.
+    mean_vec = mean.to_numpy(dtype=float)
+    std_vec = std.to_numpy(dtype=float)
+    keep = np.isfinite(mean_vec) & np.isfinite(std_vec) & (std_vec > 0.0)
+    kept_cols = [str(c) for c, ok in zip(list(mean.index), keep) if bool(ok)]
+    assert len(kept_cols) > 0
+
+    # Filter stats down to the kept columns.
+    mean = mean.loc[kept_cols].copy()
+    std = std.loc[kept_cols].copy()
 
     # Return immutable stats for downstream transforms.
-    return FrameZScoreStats(columns=list(columns), mean=mean, std=std)
+    return FrameZScoreStats(columns=list(kept_cols), mean=mean, std=std)
 
 
 def transform_frame_zscore(frame: pd.DataFrame, stats: FrameZScoreStats) -> pd.DataFrame:

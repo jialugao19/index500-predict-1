@@ -9,12 +9,13 @@ from pipeline import run_bottom_up_synthesis  # noqa: E402
 
 
 def main() -> None:
-    """Run the full pipeline with horizon=30m."""
+    """Run the full pipeline with horizon=20m."""
 
+    # Run the bottom-up pipeline under the standard AGENTS.md configuration.
     run_bottom_up_synthesis(
         seed=42,
         etf_code_int=510500,
-        label_horizon_minutes=30,
+        label_horizon_minutes=20,
         train_start=20210101,
         train_end=20231231,
         test_start=20240201,
@@ -27,3 +28,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

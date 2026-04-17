@@ -25,6 +25,34 @@ def _find_latest_run_with_metrics(report_root: str) -> str:
     return str(candidates_sorted[0])
 
 
+def _find_latest_run_with_metrics_by_horizon(report_root: str, horizon_minutes: int) -> str | None:
+    """Find latest run dir with metrics.yaml matching a specific horizon."""
+
+    # Scan completed runs and filter by config.horizon.
+    candidates: list[str] = []
+    for day_name in sorted(os.listdir(report_root)):
+        day_dir = os.path.join(report_root, day_name)
+        if not os.path.isdir(day_dir):
+            continue
+        for run_name in sorted(os.listdir(day_dir)):
+            run_dir = os.path.join(day_dir, run_name)
+            if not os.path.isdir(run_dir):
+                continue
+            metrics_path = os.path.join(run_dir, "metrics.yaml")
+            if not os.path.exists(metrics_path):
+                continue
+            with open(metrics_path, "r", encoding="utf-8") as f:
+                payload = yaml.safe_load(f)
+            if int(payload["config"]["label_horizon_minutes"]) == int(horizon_minutes):
+                candidates.append(run_dir)
+
+    if len(candidates) == 0:
+        return None
+
+    candidates_sorted = sorted(candidates, key=lambda p: os.path.getmtime(os.path.join(p, "metrics.yaml")), reverse=True)
+    return str(candidates_sorted[0])
+
+
 def _find_latest_exp1_alignment(report_root: str) -> str:
     """Find latest exp1 output dir with target_alignment_metrics.yaml."""
 
@@ -63,11 +91,15 @@ def main() -> None:
     report_root = os.path.join(repo_root, "report")
 
     # Locate baseline and experiments.
-    baseline_dir = _find_latest_run_with_metrics(report_root=report_root)
+    baseline_dir = _find_latest_run_with_metrics_by_horizon(report_root=report_root, horizon_minutes=10) or _find_latest_run_with_metrics(
+        report_root=report_root
+    )
     exp1_dir = _find_latest_exp1_alignment(report_root=report_root)
+    exp2_dir = _find_latest_run_with_metrics_by_horizon(report_root=report_root, horizon_minutes=30)
 
     baseline = _read_yaml(os.path.join(baseline_dir, "metrics.yaml"))
     exp1 = _read_yaml(os.path.join(exp1_dir, "target_alignment_metrics.yaml"))
+    exp2 = _read_yaml(os.path.join(exp2_dir, "metrics.yaml")) if exp2_dir is not None else None
 
     # Extract baseline best ETF branch metrics.
     baseline_best = baseline["selection_etf"]
@@ -93,7 +125,10 @@ def main() -> None:
     lines.append("")
     lines.append(f"- baseline_run_dir: `{baseline_dir}`")
     lines.append(f"- exp1_target_alignment_dir: `{exp1_dir}`")
-    lines.append("- exp2_horizon_30m_dir: `TBD` (运行 `python experiments/exp2_horizon_30m.py` 后再填入)")
+    if exp2_dir is None:
+        lines.append("- exp2_horizon_30m_dir: `TBD` (运行 `python experiments/exp2_horizon_30m.py` 后再填入)")
+    else:
+        lines.append(f"- exp2_horizon_30m_dir: `{exp2_dir}`")
     lines.append("")
     lines.append("## 结果对比 (test)")
     lines.append("")
@@ -107,6 +142,13 @@ def main() -> None:
         f"| exp1_target_alignment | {best_exp1_model} | {float(exp1_best['ic']):.6f} | {float(exp1_best['rank_ic']):.6f} | "
         f"{float(exp1_best['rmse']):.6f} | {float(exp1_best['mae']):.6f} | {int(exp1_best['n'])} |"
     )
+    if exp2 is not None:
+        exp2_best = exp2["selection_etf"]
+        exp2_row = exp2["etf_level"]["overall"][exp2_best["selected_model"]]["test"]
+        lines.append(
+            f"| exp2_horizon_30m | {exp2_best['selected_model']} | {float(exp2_row['ic']):.6f} | {float(exp2_row['rank_ic']):.6f} | "
+            f"{float(exp2_row['rmse']):.6f} | {float(exp2_row['mae']):.6f} | {int(exp2_row['n'])} |"
+        )
     lines.append("")
     lines.append("## 备注")
     lines.append("")
@@ -123,4 +165,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

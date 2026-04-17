@@ -710,16 +710,19 @@ def write_bottom_up_report_html(report_dir: str, run_id: str, metrics: dict) -> 
 
     # Build HTML with inline CSS and embedded images.
     css = """
-    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, "Noto Sans", sans-serif; margin: 20px; color: #111; }
-    h1, h2, h3 { margin: 0.8em 0 0.4em; }
-    .meta { background: #f6f8fa; padding: 12px 14px; border-radius: 8px; }
-    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, "Noto Sans", sans-serif; margin: 20px; color: #111; font-size: 16px; line-height: 1.55; }
+    h1 { font-size: 26px; }
+    h2 { font-size: 20px; }
+    h3 { font-size: 16px; }
+    h1, h2, h3 { margin: 0.9em 0 0.5em; }
+    .meta { background: #f6f8fa; padding: 14px 16px; border-radius: 10px; }
+    .grid { display: flex; flex-direction: column; gap: 14px; }
     .card { border: 1px solid #e5e7eb; border-radius: 10px; padding: 12px 14px; }
-    table { border-collapse: collapse; width: 100%; font-size: 12px; }
-    th, td { border-bottom: 1px solid #eee; padding: 6px 6px; text-align: right; }
+    table { border-collapse: collapse; width: 100%; font-size: 13px; }
+    th, td { border-bottom: 1px solid #eee; padding: 7px 7px; text-align: right; }
     th:first-child, td:first-child { text-align: left; }
     th { position: sticky; top: 0; background: #fff; z-index: 1; }
-    .small { font-size: 12px; color: #444; }
+    .small { font-size: 13px; color: #444; }
     code { background: #f3f4f6; padding: 1px 4px; border-radius: 4px; }
     img { max-width: 100%; height: auto; border: 1px solid #eee; border-radius: 8px; }
     """
