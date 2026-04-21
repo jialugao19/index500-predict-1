@@ -11,6 +11,9 @@ evaluation/factor_qc/
 # figures / plots
 txt/
 report/
+metrics.yaml
+feature_manifest.yaml
+report.html
 
 # 通用大文件数据
 *.parquet

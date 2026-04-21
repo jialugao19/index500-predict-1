@@ -90,22 +90,20 @@ def main() -> None:
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     report_root = os.path.join(repo_root, "report")
 
-    # Locate baseline and experiments.
-    baseline_dir = _find_latest_run_with_metrics_by_horizon(report_root=report_root, horizon_minutes=10) or _find_latest_run_with_metrics(
-        report_root=report_root
-    )
+    # Locate the current 30m mainline and the historical alignment experiment.
+    baseline_dir = _find_latest_run_with_metrics_by_horizon(report_root=report_root, horizon_minutes=30)
+    assert baseline_dir is not None
     exp1_dir = _find_latest_exp1_alignment(report_root=report_root)
-    exp2_dir = _find_latest_run_with_metrics_by_horizon(report_root=report_root, horizon_minutes=30)
 
     baseline = _read_yaml(os.path.join(baseline_dir, "metrics.yaml"))
     exp1 = _read_yaml(os.path.join(exp1_dir, "target_alignment_metrics.yaml"))
-    exp2 = _read_yaml(os.path.join(exp2_dir, "metrics.yaml")) if exp2_dir is not None else None
+    exp1_base_dir = str(exp1["base_run_dir"])
 
-    # Extract baseline best ETF branch metrics.
+    # Extract the current 30m mainline ETF metrics.
     baseline_best = baseline["selection_etf"]
     baseline_etf = baseline["etf_level"]["overall"][baseline_best["selected_model"]]["test"]
 
-    # Extract exp1 best aligned model by test rank_ic.
+    # Extract the best historical alignment result by test rank_ic.
     exp1_overall = exp1["metrics"]["overall"]
     best_exp1_model = None
     best_rank_ic = -1e9
@@ -119,42 +117,32 @@ def main() -> None:
 
     # Compose markdown report.
     lines: list[str] = []
-    lines.append("# 实验研究报告: 聚合后 IC 下降 (Baseline vs Exp1 vs Exp2)")
+    lines.append("# 实验研究报告: 当前 30m 主线 vs 历史 Alignment 实验")
     lines.append("")
     lines.append("## 路径 (Paths)")
     lines.append("")
-    lines.append(f"- baseline_run_dir: `{baseline_dir}`")
+    lines.append(f"- mainline_30m_run_dir: `{baseline_dir}`")
     lines.append(f"- exp1_target_alignment_dir: `{exp1_dir}`")
-    if exp2_dir is None:
-        lines.append("- exp2_horizon_30m_dir: `TBD` (运行 `python experiments/exp2_horizon_30m.py` 后再填入)")
-    else:
-        lines.append(f"- exp2_horizon_30m_dir: `{exp2_dir}`")
+    lines.append(f"- exp1_source_run_dir: `{exp1_base_dir}`")
     lines.append("")
     lines.append("## 结果对比 (test)")
     lines.append("")
     lines.append("| item | model | ic | rank_ic | rmse | mae | n |")
     lines.append("| --- | --- | --- | --- | --- | --- | --- |")
     lines.append(
-        f"| baseline_etf | {baseline_best['selected_model']} | {float(baseline_etf['ic']):.6f} | {float(baseline_etf['rank_ic']):.6f} | "
+        f"| mainline_30m_etf | {baseline_best['selected_model']} | {float(baseline_etf['ic']):.6f} | {float(baseline_etf['rank_ic']):.6f} | "
         f"{float(baseline_etf['rmse']):.6f} | {float(baseline_etf['mae']):.6f} | {int(baseline_etf['n'])} |"
     )
     lines.append(
-        f"| exp1_target_alignment | {best_exp1_model} | {float(exp1_best['ic']):.6f} | {float(exp1_best['rank_ic']):.6f} | "
+        f"| historical_exp1_target_alignment | {best_exp1_model} | {float(exp1_best['ic']):.6f} | {float(exp1_best['rank_ic']):.6f} | "
         f"{float(exp1_best['rmse']):.6f} | {float(exp1_best['mae']):.6f} | {int(exp1_best['n'])} |"
     )
-    if exp2 is not None:
-        exp2_best = exp2["selection_etf"]
-        exp2_row = exp2["etf_level"]["overall"][exp2_best["selected_model"]]["test"]
-        lines.append(
-            f"| exp2_horizon_30m | {exp2_best['selected_model']} | {float(exp2_row['ic']):.6f} | {float(exp2_row['rank_ic']):.6f} | "
-            f"{float(exp2_row['rmse']):.6f} | {float(exp2_row['mae']):.6f} | {int(exp2_row['n'])} |"
-        )
     lines.append("")
     lines.append("## 备注")
     lines.append("")
-    lines.append("- baseline_etf 指标来自 pipeline 输出 `metrics.yaml` 的 `selection_etf`。")
-    lines.append("- exp1_target_alignment 是在 train 上对 `basket_pred -> label_etf_10m` 做线性 stacking 后再评估。")
-    lines.append("- exp2_horizon_30m 需要完整重跑, 产出新的 `metrics.yaml` 后再补充到本报告。")
+    lines.append("- 当前默认主线已经统一为 `30m`，主线指标来自该 horizon 的 pipeline 输出 `metrics.yaml`。")
+    lines.append("- `exp1_target_alignment` 是历史实验，来源于其 `base_run_dir` 对应的旧主线输出，不再代表当前默认主线。")
+    lines.append("- 若要评估 alignment 在 `30m` 主线下是否仍然有效，应基于新的 `30m` baseline 重新生成一次 exp1 结果。")
     lines.append("")
 
     out_path = os.path.join(report_root, "experiment_research_report.md")

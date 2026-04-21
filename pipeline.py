@@ -926,14 +926,31 @@ def run_bottom_up_synthesis(
     # Stage 5: Assemble one metrics.yaml for the full three-layer evaluation.
     metrics = {
         "config": {
+            "run_id": str(run_id),
+            "report_dir": str(report_dir),
+            "report_day_tag": str(day_tag),
             "seed": int(seed),
             "etf_code_int": int(etf_code_int),
             "label_horizon_minutes": int(label_horizon_minutes),
+            "stock_factor_set": str(factor_set_name),
+            "etf_factor_set": str(etf_factor_set_name),
             "train_range": [int(train_start), int(train_end)],
             "test_start": int(test_start),
             "test_end": int(test_end),
             "used_train_days": int(len(train_dates)),
             "used_test_days": int(len(test_dates)),
+            "train_sample_rows": int(len(train_sample)),
+            "stock_cache_jobs": int(stock_cache_jobs),
+            "data_roots": {
+                "weight_path": str(weight_path),
+                "etf1m_root": str(etf1m_root),
+                "stock1m_root": str(stock1m_root),
+                "specs_root": str(specs_root),
+            },
+            "cache_roots": {
+                "stock_panel_base_cache_root": str(stock_panel_base_cache_root),
+                "stock_panel_feature_cache_root": str(stock_panel_feature_cache_root),
+            },
         },
         "stock_alpha": stock_alpha_metrics,
         "basis_eval": {
@@ -979,6 +996,16 @@ def run_bottom_up_synthesis(
             "selected_test_rmse": float(best_row["rmse"]),
             "selected_test_mae": float(best_row["mae"]),
         },
+        "artifacts": {
+            "feature_manifest_yaml": "feature_manifest.yaml",
+            "basis_pred_vs_etf_parquet": "basis_pred_vs_etf.parquet",
+            "basket_pred_parquet": "basket_pred.parquet",
+            "predictions_parquet": "predictions.parquet",
+            "stock_metrics_test_parquet": "stock_metrics_test.parquet",
+            "synthetic_vs_real_etf_parquet": "synthetic_vs_real_etf.parquet",
+            "report_md": "report.md",
+            "report_html": "report.html",
+        },
     }
     write_yaml(os.path.join(report_dir, "metrics.yaml"), metrics)
     write_bottom_up_report_md(report_dir=report_dir, run_id=run_id, metrics=metrics)
@@ -991,7 +1018,15 @@ def run_bottom_up_synthesis(
 
     # Stage 5: Create stable top-level deliverable links for the caller.
     for name, target in [
+        ("feature_manifest.yaml", os.path.join(report_dir, "feature_manifest.yaml")),
+        ("basis_pred_vs_etf.parquet", os.path.join(report_dir, "basis_pred_vs_etf.parquet")),
         ("basket_pred.parquet", basket_pred_path),
+        ("predictions.parquet", etf_pred_path),
+        ("stock_metrics_test.parquet", stock_metrics_path),
+        ("synthetic_vs_real_etf.parquet", os.path.join(report_dir, "synthetic_vs_real_etf.parquet")),
+        ("metrics.yaml", os.path.join(report_dir, "metrics.yaml")),
+        ("report.md", os.path.join(report_dir, "report.md")),
+        ("report.html", os.path.join(report_dir, "report.html")),
     ]:
         out_path = os.path.join(repo_root, name)
         if os.path.islink(out_path) or os.path.exists(out_path):
@@ -1034,7 +1069,7 @@ if __name__ == "__main__":
     report_dir = run_bottom_up_synthesis(
         seed=42,
         etf_code_int=510500,
-        label_horizon_minutes=10,
+        label_horizon_minutes=30,
         train_start=20210101,
         train_end=20231231,
         test_start=20240201,
