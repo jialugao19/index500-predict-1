@@ -30,6 +30,13 @@ from eval.walk_forward import run_walk_forward_validation
 from features.builders.etf import build_etf_features_day
 from features.etf import compute_label_from_close
 from models.lgbm import fit_lgbm_model
+from models.basis import (
+    build_basis_model_frame,
+    build_component_basis_features_day,
+    fit_basis_model_bundle,
+    predict_basis_model_bundle,
+    select_basis_feature_columns,
+)
 from models.zscore import (
     fit_frame_zscore_stats,
     fit_series_zscore_stats,
@@ -39,14 +46,17 @@ from models.zscore import (
 )
 from models.xgb import fit_xgb_model
 from eval.plots import (
+    compute_nonoverlap_backtest_summary,
     plot_baseline_comparison,
     plot_cumulative_metric,
     plot_daily_timeseries,
+    plot_prediction_bucket_calibration_spread,
     plot_feature_importance,
     plot_monthly_timeseries,
     plot_prediction_scatter,
     plot_prediction_timeseries,
     plot_etf_backtest_compare,
+    plot_rolling_ic_rankic,
     plot_histogram,
 )
 from eval.writers import (
@@ -281,6 +291,151 @@ def collect_stock_training_sample(
     return sample
 
 
+def fit_stock_model_bundle(
+    train_dates: list[int],
+    weights: pd.DataFrame,
+    stock1m_root: str,
+    horizon_minutes: int,
+    base_cache_root: str,
+    feature_cache_root: str,
+    specs_root: str,
+    factor_set_name: str,
+    feature_cols: list[str],
+    max_rows: int,
+    sample_mod: int,
+    seed: int,
+) -> dict:
+    """Fit stock XGB and LightGBM models for a date set."""
+
+    # Collect a deterministic training sample from the requested stock dates.
+    train_sample = collect_stock_training_sample(
+        dates=list(train_dates),
+        weights=weights,
+        stock1m_root=stock1m_root,
+        horizon_minutes=horizon_minutes,
+        base_cache_root=base_cache_root,
+        feature_cache_root=feature_cache_root,
+        specs_root=specs_root,
+        factor_set_name=factor_set_name,
+        feature_cols=feature_cols,
+        max_rows=max_rows,
+        sample_mod=sample_mod,
+    )
+    train_sample = train_sample.rename(columns={"label_stock_10m": "label"})
+    train_sample["month"] = (train_sample["date"].astype(int) // 100).astype(int)
+    val_month = int(train_sample["month"].max())
+    val = train_sample.loc[train_sample["month"] == val_month].copy()
+    train_fit = train_sample.loc[train_sample["month"] < val_month].copy()
+    assert len(train_fit) > 0
+    assert len(val) > 0
+
+    # Fit feature and label standardization only on the fitting fold.
+    stock_feature_stats = fit_frame_zscore_stats(frame=train_fit, columns=feature_cols)
+    stock_feature_cols = list(stock_feature_stats.columns)
+    stock_label_stats = fit_series_zscore_stats(series=train_fit["label"], name="label_stock_10m")
+    train_fit = transform_frame_zscore(frame=train_fit, stats=stock_feature_stats)
+    val = transform_frame_zscore(frame=val, stats=stock_feature_stats)
+    train_fit["label"] = transform_series_zscore(series=train_fit["label"], stats=stock_label_stats)
+    val["label"] = transform_series_zscore(series=val["label"], stats=stock_label_stats)
+
+    # Fit the two allowed stock-model families.
+    stock_xgb_model = fit_xgb_model(train=train_fit, val=val, features=stock_feature_cols, seed=seed)
+    stock_lgbm_model = fit_lgbm_model(train=train_fit, val=val, features=stock_feature_cols, seed=seed)
+
+    # Return model artifacts and training diagnostics.
+    return {
+        "xgb_model": stock_xgb_model,
+        "lgbm_model": stock_lgbm_model,
+        "feature_stats": stock_feature_stats,
+        "label_stats": stock_label_stats,
+        "feature_cols": stock_feature_cols,
+        "train_sample": train_sample,
+        "train_fit_rows": int(len(train_fit)),
+        "val_rows": int(len(val)),
+        "val_month": int(val_month),
+    }
+
+
+def predict_stock_model_bundle(day: pd.DataFrame, bundle: dict) -> dict[str, np.ndarray]:
+    """Predict stock returns from a fitted stock-model bundle."""
+
+    # Standardize day features with the training-fold stock feature stats.
+    feature_cols = list(bundle["feature_cols"])
+    day_features = transform_frame_zscore(frame=day.loc[:, feature_cols], stats=bundle["feature_stats"])
+
+    # Predict standardized labels and map predictions back to raw return units.
+    xgb_pred_z = bundle["xgb_model"].predict(day_features.to_numpy())
+    lgbm_pred_z = bundle["lgbm_model"].predict(day_features.to_numpy())
+    xgb_pred = inverse_series_zscore(values=xgb_pred_z, stats=bundle["label_stats"])
+    lgbm_pred = inverse_series_zscore(values=lgbm_pred_z, stats=bundle["label_stats"])
+    return {"xgb": xgb_pred.astype(float), "lgbm": lgbm_pred.astype(float)}
+
+
+def build_oof_basket_predictions(
+    train_dates: list[int],
+    weights: pd.DataFrame,
+    stock1m_root: str,
+    horizon_minutes: int,
+    base_cache_root: str,
+    feature_cache_root: str,
+    specs_root: str,
+    factor_set_name: str,
+    feature_cols: list[str],
+    seed: int,
+) -> pd.DataFrame:
+    """Build expanding-year OOF basket predictions for basis training."""
+
+    # Define expanding folds so each residual label uses out-of-fold basket predictions.
+    years = sorted(set([int(date) // 10000 for date in train_dates]))
+    fold_rows: list[pd.DataFrame] = []
+    for pred_year in years[1:]:
+        fit_dates = [int(date) for date in train_dates if int(date) // 10000 < int(pred_year)]
+        pred_dates = [int(date) for date in train_dates if int(date) // 10000 == int(pred_year)]
+        assert len(fit_dates) > 0
+        assert len(pred_dates) > 0
+
+        # Fit stock models on prior years only.
+        bundle = fit_stock_model_bundle(
+            train_dates=fit_dates,
+            weights=weights,
+            stock1m_root=stock1m_root,
+            horizon_minutes=horizon_minutes,
+            base_cache_root=base_cache_root,
+            feature_cache_root=feature_cache_root,
+            specs_root=specs_root,
+            factor_set_name=factor_set_name,
+            feature_cols=feature_cols,
+            max_rows=2_000_000,
+            sample_mod=50,
+            seed=seed,
+        )
+
+        # Predict the held-out year and aggregate to basket-level OOF returns.
+        for date in pred_dates:
+            day = load_or_build_stock_panel_day(
+                date=int(date),
+                weights=weights,
+                stock1m_root=stock1m_root,
+                horizon_minutes=horizon_minutes,
+                base_cache_root=base_cache_root,
+                feature_cache_root=feature_cache_root,
+                specs_root=specs_root,
+                factor_set_name=factor_set_name,
+            )
+            day = day.loc[day["split"].astype(str) == "train"].copy()
+            day = day.dropna(subset=["label_stock_10m"])
+            pred = predict_stock_model_bundle(day=day, bundle=bundle)
+            basket_xgb = aggregate_day_to_basket(stock_day=day, pred=pred["xgb"], pred_col_name="pred_stock_xgb_oof")
+            basket_xgb["model_name"] = "basket_stock_xgb"
+            basket_lgbm = aggregate_day_to_basket(stock_day=day, pred=pred["lgbm"], pred_col_name="pred_stock_lgbm_oof")
+            basket_lgbm["model_name"] = "basket_stock_lgbm"
+            fold_rows.append(pd.concat([basket_xgb, basket_lgbm], axis=0, ignore_index=True))
+
+    # Return all OOF rows for downstream basis-label construction.
+    oof = pd.concat(fold_rows, axis=0, ignore_index=True)
+    return oof
+
+
 def build_etf_minute_dataset(
     dates: list[int],
     etf1m_root: str,
@@ -302,6 +457,7 @@ def build_etf_minute_dataset(
         # Assemble a day frame with stable columns for joins.
         day = etf_features.copy()
         day = day.rename(columns={"DateTime": "datetime", "Date": "date"})
+        day["close"] = etf_day["Close"].astype(float).to_numpy()
         day["MinuteIndex"] = etf_day["MinuteIndex"].astype(int).to_numpy()
         day["label_etf_10m"] = label.astype(float).to_numpy()
         day["split"] = date_to_split(date=int(date))
@@ -432,8 +588,8 @@ def run_bottom_up_synthesis(
     write_yaml(path=os.path.join(report_dir, "feature_manifest.yaml"), obj={"stock": stock_manifest, "etf": etf_manifest})
 
     # Stage 2: Fit stock-level models on a deterministic subsample.
-    train_sample = collect_stock_training_sample(
-        dates=list(train_dates),
+    stock_bundle = fit_stock_model_bundle(
+        train_dates=list(train_dates),
         weights=weights,
         stock1m_root=stock1m_root,
         horizon_minutes=label_horizon_minutes,
@@ -444,26 +600,32 @@ def run_bottom_up_synthesis(
         feature_cols=stock_feature_cols,
         max_rows=2_000_000,
         sample_mod=50,
+        seed=seed,
     )
-    train_sample = train_sample.rename(columns={"label_stock_10m": "label"})
-    train_sample["month"] = (train_sample["date"].astype(int) // 100).astype(int)
-    val_month = int(train_sample["month"].max())
-    val = train_sample.loc[train_sample["month"] == val_month].copy()
-    train_fit = train_sample.loc[train_sample["month"] < val_month].copy()
-    print(f"[INFO] Stock train_fit rows={len(train_fit)}, val rows={len(val)} (sampled).")
+    train_sample = stock_bundle["train_sample"]
+    stock_feature_cols = list(stock_bundle["feature_cols"])
+    stock_xgb_model = stock_bundle["xgb_model"]
+    stock_lgbm_model = stock_bundle["lgbm_model"]
+    print(
+        f"[INFO] Stock train_fit rows={int(stock_bundle['train_fit_rows'])}, val rows={int(stock_bundle['val_rows'])} (sampled)."
+    )
 
-    # Stage 2: Fit feature/label z-score statistics on the true training fold only.
-    stock_feature_stats = fit_frame_zscore_stats(frame=train_fit, columns=stock_feature_cols)
-    stock_feature_cols = list(stock_feature_stats.columns)
-    stock_label_stats = fit_series_zscore_stats(series=train_fit["label"], name="label_stock_10m")
-    train_fit = transform_frame_zscore(frame=train_fit, stats=stock_feature_stats)
-    val = transform_frame_zscore(frame=val, stats=stock_feature_stats)
-    train_fit["label"] = transform_series_zscore(series=train_fit["label"], stats=stock_label_stats)
-    val["label"] = transform_series_zscore(series=val["label"], stats=stock_label_stats)
-
-    # Stage 2: Train the required XGBoost + LightGBM unified panel models.
-    stock_xgb_model = fit_xgb_model(train=train_fit, val=val, features=stock_feature_cols, seed=seed)
-    stock_lgbm_model = fit_lgbm_model(train=train_fit, val=val, features=stock_feature_cols, seed=seed)
+    # Stage 2b: Build expanding-year OOF basket predictions for residual basis training.
+    oof_basket_all = build_oof_basket_predictions(
+        train_dates=list(train_dates),
+        weights=weights,
+        stock1m_root=stock1m_root,
+        horizon_minutes=label_horizon_minutes,
+        base_cache_root=stock_panel_base_cache_root,
+        feature_cache_root=stock_panel_feature_cache_root,
+        specs_root=specs_root,
+        factor_set_name=factor_set_name,
+        feature_cols=stock_feature_cols,
+        seed=seed,
+    )
+    oof_basket_pred_path = os.path.join(report_dir, "oof_basket_pred.parquet")
+    oof_basket_all.to_parquet(oof_basket_pred_path, index=False)
+    print(f"[INFO] OOF basket rows={len(oof_basket_all)}.")
 
     # Stage 2: Export stock-model feature importance artifacts for the report.
     stock_xgb_importance = [
@@ -491,6 +653,7 @@ def run_bottom_up_synthesis(
     stock_daily_ic_tables: list[pd.DataFrame] = []
     stock_ts_pred_tables: list[pd.DataFrame] = []
     basket_rows: list[pd.DataFrame] = []
+    component_rows: list[pd.DataFrame] = []
     for date in dates_needed:
         # Load cached day panel and keep train/test rows only.
         day = load_or_build_stock_panel_day(
@@ -506,12 +669,13 @@ def run_bottom_up_synthesis(
         day = day.loc[day["split"].isin(["train", "test"])].copy()
         day = day.dropna(subset=["label_stock_10m"])
 
-        # Predict stock returns with the panel XGB model.
-        day_features = transform_frame_zscore(frame=day.loc[:, stock_feature_cols], stats=stock_feature_stats)
-        xgb_pred_z = stock_xgb_model.predict(day_features.to_numpy())
-        lgbm_pred_z = stock_lgbm_model.predict(day_features.to_numpy())
-        xgb_pred = inverse_series_zscore(values=xgb_pred_z, stats=stock_label_stats)
-        lgbm_pred = inverse_series_zscore(values=lgbm_pred_z, stats=stock_label_stats)
+        # Predict stock returns with the full stock model bundle.
+        pred = predict_stock_model_bundle(day=day, bundle=stock_bundle)
+        xgb_pred = pred["xgb"]
+        lgbm_pred = pred["lgbm"]
+
+        # Collect constituent state features for the second-stage basis model.
+        component_rows.append(build_component_basis_features_day(stock_day=day))
 
         # Collect stock-level pooled time-series prediction rows for TS-IC evaluation.
         stock_ts_pred_tables.append(
@@ -634,6 +798,8 @@ def run_bottom_up_synthesis(
             "fig_stock_lgbm_feature_importance": "fig_stock_lgbm_feature_importance.png",
         },
     }
+    assert len(stock_alpha_metrics["overall"]) > 0
+    assert len(stock_alpha_metrics["minute_bucket_ic_test"]) > 0
     # Compute per-stock time-series metrics on the test split for stock-level diagnostics.
     stock_ts_stats = pd.concat(stock_ts_stats_tables, axis=0, ignore_index=True)
     stock_ts_stats_sum = stock_ts_stats.groupby("stock_code", sort=True).sum(numeric_only=True).reset_index()
@@ -746,6 +912,9 @@ def run_bottom_up_synthesis(
     basket_all = pd.concat(basket_rows, axis=0, ignore_index=True)
     basket_pred_path = os.path.join(report_dir, "basket_pred.parquet")
     basket_all.to_parquet(basket_pred_path, index=False)
+    component_all = pd.concat(component_rows, axis=0, ignore_index=True)
+    component_features_path = os.path.join(report_dir, "basis_component_features.parquet")
+    component_all.to_parquet(component_features_path, index=False)
     basket_pred_tables: list[pd.DataFrame] = []
     for model_name, part in basket_all.groupby("model_name", sort=True):
         basket_pred_tables.append(make_basket_prediction_table(basket=part, model_name=str(model_name)))
@@ -782,7 +951,7 @@ def run_bottom_up_synthesis(
 
         # Append a compact per-minute basis table for research inspection.
         out = joined.loc[:, ["date", "datetime", "split", "MinuteIndex", "basket_pred", "label_etf_10m"]].copy()
-        out["basis"] = out["basket_pred"].astype(float) - out["label_etf_10m"].astype(float)
+        out["basis"] = out["label_etf_10m"].astype(float) - out["basket_pred"].astype(float)
         out["model_name"] = str(model_name)
         basis_join_rows.append(out)
 
@@ -888,10 +1057,75 @@ def run_bottom_up_synthesis(
     for model_name in sorted(basket_all["model_name"].astype(str).unique().tolist()):
         basket_branches[str(model_name)] = basket_all.loc[
             basket_all["model_name"].astype(str) == str(model_name),
-            ["date", "datetime", "split", "basket_pred"],
+            ["date", "datetime", "split", "basket_pred", "weight_coverage_pred"],
         ].copy()
 
-    # Stage 4: Build ETF prediction tables for all basket branches.
+    # Stage 4b: Fit OOF residual basis models and build two-stage ETF prediction branches.
+    basis_model_pred_rows: list[pd.DataFrame] = []
+    basis_model_feature_rows: list[pd.DataFrame] = []
+    basis_model_diagnostics: dict[str, dict] = {}
+    two_stage_branches: dict[str, pd.DataFrame] = {}
+    for branch_name, basket_pred in basket_branches.items():
+        # Build residual training rows from OOF basket predictions for this branch.
+        oof_branch = oof_basket_all.loc[oof_basket_all["model_name"].astype(str) == str(branch_name)].copy()
+        oof_basis_frame = build_basis_model_frame(
+            etf_dataset=etf_dataset,
+            basket_pred=oof_branch,
+            component_features=component_all,
+        )
+        full_basis_frame = build_basis_model_frame(
+            etf_dataset=etf_dataset,
+            basket_pred=basket_pred,
+            component_features=component_all,
+        )
+        basis_feature_cols = select_basis_feature_columns(frame=oof_basis_frame)
+        basis_bundle = fit_basis_model_bundle(train_frame=oof_basis_frame, feature_cols=basis_feature_cols, seed=seed)
+        basis_pred = predict_basis_model_bundle(frame=full_basis_frame, bundle=basis_bundle)
+
+        # Store feature and training diagnostics for auditability.
+        feature_preview_cols = list(dict.fromkeys(["date", "datetime", "split", "MinuteIndex", "basis_label"] + list(basis_bundle["feature_cols"])))
+        feature_preview = oof_basis_frame.loc[:, feature_preview_cols].copy()
+        feature_preview["branch_name"] = str(branch_name)
+        basis_model_feature_rows.append(feature_preview)
+        basis_model_diagnostics[str(branch_name)] = {
+            "feature_count": int(len(basis_bundle["feature_cols"])),
+            "train_rows": int(basis_bundle["train_rows"]),
+            "val_rows": int(basis_bundle["val_rows"]),
+            "val_month": int(basis_bundle["val_month"]),
+            "feature_cols": list(basis_bundle["feature_cols"]),
+            "xgb_feature_importance_top20": sorted(
+                basis_bundle["xgb_importance"], key=lambda row: float(row["importance"]), reverse=True
+            )[:20],
+            "lgbm_feature_importance_top20": sorted(
+                basis_bundle["lgbm_importance"], key=lambda row: float(row["importance"]), reverse=True
+            )[:20],
+        }
+
+        # Convert residual predictions into final ETF predictions for both basis models.
+        for basis_model_name, residual_pred in basis_pred.items():
+            final_pred = full_basis_frame["basket_pred"].to_numpy(dtype=float) + residual_pred.astype(float)
+            two_stage_name = f"two_stage_{branch_name}_{basis_model_name}_vs_etf"
+            two_stage_frame = full_basis_frame.loc[:, ["date", "datetime", "split"]].copy()
+            two_stage_frame["basket_pred"] = final_pred.astype(float)
+            two_stage_branches[str(two_stage_name)] = two_stage_frame
+            basis_out = full_basis_frame.loc[
+                :, ["date", "datetime", "split", "MinuteIndex", "basket_pred", "label_etf_10m", "basis_label"]
+            ].copy()
+            basis_out["basis_pred"] = residual_pred.astype(float)
+            basis_out["final_pred"] = final_pred.astype(float)
+            basis_out["branch_name"] = str(branch_name)
+            basis_out["basis_model_name"] = str(basis_model_name)
+            basis_out["model_name"] = str(two_stage_name)
+            basis_model_pred_rows.append(basis_out)
+
+    # Stage 4b: Write second-stage basis artifacts.
+    basis_model_pred = pd.concat(basis_model_pred_rows, axis=0, ignore_index=True)
+    basis_model_pred_path = os.path.join(report_dir, "basis_model_pred.parquet")
+    basis_model_pred.to_parquet(basis_model_pred_path, index=False)
+    basis_features_path = os.path.join(report_dir, "basis_features.parquet")
+    pd.concat(basis_model_feature_rows, axis=0, ignore_index=True).to_parquet(basis_features_path, index=False)
+
+    # Stage 4: Build ETF prediction tables for all raw and two-stage basket branches.
     etf_pred_tables: list[pd.DataFrame] = []
     for branch_name, basket_pred in basket_branches.items():
         # Build the raw join table for this basket branch.
@@ -905,6 +1139,17 @@ def run_bottom_up_synthesis(
                 label_col="label_etf_10m",
             )
         )
+    for model_name, two_stage_pred in two_stage_branches.items():
+        # Build the corrected ETF prediction table for this two-stage branch.
+        joined = etf_dataset.merge(two_stage_pred, on=["date", "datetime", "split"], how="inner")
+        etf_pred_tables.append(
+            make_etf_prediction_table(
+                frame=joined,
+                model_name=str(model_name),
+                pred=joined["basket_pred"].to_numpy(dtype=float),
+                label_col="label_etf_10m",
+            )
+        )
 
     # Stage 5: Compute ETF-level metrics and write predictions parquet.
     etf_pred_table = pd.concat(etf_pred_tables, axis=0, ignore_index=True)
@@ -912,16 +1157,89 @@ def run_bottom_up_synthesis(
     etf_pred_table.to_parquet(etf_pred_path, index=False)
     etf_metrics = compute_metrics(pred_table=etf_pred_table)
 
+    # Stage 5: Evaluate residual basis predictions as their own alpha space.
+    residual_pred_table = basis_model_pred.loc[
+        :, ["date", "datetime", "split", "basis_pred", "basis_label", "model_name"]
+    ].copy()
+    residual_pred_table = residual_pred_table.rename(columns={"basis_pred": "pred", "basis_label": "label"})
+    residual_pred_table["model_name"] = "residual_" + residual_pred_table["model_name"].astype(str)
+    basis_model_metrics = compute_metrics(pred_table=residual_pred_table)
+    raw_vs_two_stage_delta: list[dict] = []
+    for model_name, part in basis_model_pred.groupby("model_name", sort=True):
+        # Compare each two-stage model against its raw basket branch on the test split.
+        branch_name = str(part["branch_name"].iloc[0])
+        raw_model_name = f"raw_{branch_name}_vs_etf"
+        two_stage_row = etf_metrics["overall"][str(model_name)]["test"]
+        raw_row = etf_metrics["overall"][raw_model_name]["test"]
+        test_part = part.loc[part["split"].astype(str) == "test"].copy()
+        raw_vs_two_stage_delta.append(
+            {
+                "raw_model": str(raw_model_name),
+                "two_stage_model": str(model_name),
+                "ic_delta": float(two_stage_row["ic"]) - float(raw_row["ic"]),
+                "rank_ic_delta": float(two_stage_row["rank_ic"]) - float(raw_row["rank_ic"]),
+                "rmse_delta": float(two_stage_row["rmse"]) - float(raw_row["rmse"]),
+                "mae_delta": float(two_stage_row["mae"]) - float(raw_row["mae"]),
+                "basis_pred_vs_basis_label_ic": safe_corr(
+                    test_part["basis_pred"].to_numpy(dtype=float),
+                    test_part["basis_label"].to_numpy(dtype=float),
+                ),
+                "basis_pred_vs_basket_pred_corr": safe_corr(
+                    test_part["basis_pred"].to_numpy(dtype=float),
+                    test_part["basket_pred"].to_numpy(dtype=float),
+                ),
+            }
+        )
+
     # Stage 5: Choose the best model by ETF test RankIC (selection rule in AGENTS.md).
     best_model = pick_best_model_by_metric(etf_overall=etf_metrics["overall"], split="test", metric_name="rank_ic")
     best_row = etf_metrics["overall"][best_model]["test"]
 
     # Stage 5: Plot a simple ETF backtest compare chart for the selected model on test.
+    etf_price_frames: list[pd.DataFrame] = []
+    for date in test_dates:
+        # Load one full test day of ETF prices for benchmark plotting.
+        etf_day = load_etf_minute_bars(etf1m_root=etf1m_root, date=int(date), etf_code_int=etf_code_int)
+        etf_price_frames.append(
+            etf_day.loc[:, ["Date", "DateTime", "Close"]].rename(
+                columns={"Date": "date", "DateTime": "datetime", "Close": "close"}
+            )
+        )
+    etf_price_table = pd.concat(etf_price_frames, axis=0, ignore_index=True)
     plot_etf_backtest_compare(
         pred_table=etf_pred_table,
         model_name=best_model,
         out_path=os.path.join(report_dir, "fig_etf_backtest_compare_test.png"),
+        etf_price_table=etf_price_table,
+        horizon_minutes=label_horizon_minutes,
     )
+    backtest_summary = compute_nonoverlap_backtest_summary(
+        pred_table=etf_pred_table,
+        model_name=best_model,
+        etf_price_table=etf_price_table,
+        horizon_minutes=label_horizon_minutes,
+    )
+
+    # Stage 5: State whether this run is a complete clean benchmark candidate.
+    benchmark_conclusion = {
+        "is_clean_benchmark_candidate": True,
+        "reason": (
+            "This run contains non-empty Stock/Basket/Basis/ETF metrics and uses a non-overlap ETF backtest "
+            "with a long ETF benchmark built from actual close prices."
+        ),
+        "required_sections": [
+            "stock_alpha",
+            "basket_synthesis",
+            "basis_eval",
+            "basis_model",
+            "etf_level",
+            "selection_etf.nonoverlap_backtest_test",
+        ],
+        "known_limitations": [
+            "The non-overlap strategy is still a simple sign(pred) rule without transaction cost or slippage.",
+            "ETF model selection is reported on the test split, so future strategy rules should be defined on train or validation first.",
+        ],
+    }
 
     # Stage 5: Assemble one metrics.yaml for the full three-layer evaluation.
     metrics = {
@@ -976,6 +1294,20 @@ def run_bottom_up_synthesis(
             "selected_test_rmse": float(basis_metrics["overall"][best_basis_model]["test"]["rmse"]),
             "selected_test_mae": float(basis_metrics["overall"][best_basis_model]["test"]["mae"]),
         },
+        "basis_model": {
+            "label_definition": "basis_label = label_etf_horizon - basket_pred_oof_horizon",
+            "final_prediction_definition": "final_pred = basket_pred + basis_pred",
+            "oof_method": "expanding_year",
+            "residual_overall": basis_model_metrics["overall"],
+            "raw_vs_two_stage_delta_test": raw_vs_two_stage_delta,
+            "branch_diagnostics": basis_model_diagnostics,
+            "artifacts": {
+                "oof_basket_pred_parquet": "oof_basket_pred.parquet",
+                "basis_component_features_parquet": "basis_component_features.parquet",
+                "basis_features_parquet": "basis_features.parquet",
+                "basis_model_pred_parquet": "basis_model_pred.parquet",
+            },
+        },
         "synthetic_vs_real_etf": {
             "overall": synthetic_vs_real,
             "minute_bucket_test": synthetic_bucket.to_dict(orient="records"),
@@ -995,16 +1327,25 @@ def run_bottom_up_synthesis(
             "selected_test_rank_ic": float(best_row["rank_ic"]),
             "selected_test_rmse": float(best_row["rmse"]),
             "selected_test_mae": float(best_row["mae"]),
+            "nonoverlap_backtest_test": backtest_summary,
         },
+        "benchmark_conclusion": benchmark_conclusion,
         "artifacts": {
             "feature_manifest_yaml": "feature_manifest.yaml",
             "basis_pred_vs_etf_parquet": "basis_pred_vs_etf.parquet",
+            "oof_basket_pred_parquet": "oof_basket_pred.parquet",
+            "basis_component_features_parquet": "basis_component_features.parquet",
+            "basis_features_parquet": "basis_features.parquet",
+            "basis_model_pred_parquet": "basis_model_pred.parquet",
             "basket_pred_parquet": "basket_pred.parquet",
             "predictions_parquet": "predictions.parquet",
             "stock_metrics_test_parquet": "stock_metrics_test.parquet",
             "synthetic_vs_real_etf_parquet": "synthetic_vs_real_etf.parquet",
             "report_md": "report.md",
             "report_html": "report.html",
+            "fig_etf_backtest_compare_test": "fig_etf_backtest_compare_test.png",
+            "fig_etf_rolling_ic_rankic_test": "fig_etf_rolling_ic_rankic_test.png",
+            "fig_etf_pred_bucket_calibration_spread_test": "fig_etf_pred_bucket_calibration_spread_test.png",
         },
     }
     write_yaml(os.path.join(report_dir, "metrics.yaml"), metrics)
@@ -1020,6 +1361,10 @@ def run_bottom_up_synthesis(
     for name, target in [
         ("feature_manifest.yaml", os.path.join(report_dir, "feature_manifest.yaml")),
         ("basis_pred_vs_etf.parquet", os.path.join(report_dir, "basis_pred_vs_etf.parquet")),
+        ("oof_basket_pred.parquet", os.path.join(report_dir, "oof_basket_pred.parquet")),
+        ("basis_component_features.parquet", os.path.join(report_dir, "basis_component_features.parquet")),
+        ("basis_features.parquet", os.path.join(report_dir, "basis_features.parquet")),
+        ("basis_model_pred.parquet", os.path.join(report_dir, "basis_model_pred.parquet")),
         ("basket_pred.parquet", basket_pred_path),
         ("predictions.parquet", etf_pred_path),
         ("stock_metrics_test.parquet", stock_metrics_path),
@@ -1058,6 +1403,19 @@ def run_bottom_up_synthesis(
         title=f"Monthly IC ({best_model}, test)",
         out_path=os.path.join(report_dir, "fig_best_monthly_ic.png"),
     )
+    plot_rolling_ic_rankic(
+        daily=best_daily,
+        title=f"ETF Rolling IC / RankIC ({best_model}, test)",
+        out_path=os.path.join(report_dir, "fig_etf_rolling_ic_rankic_test.png"),
+    )
+    plot_prediction_bucket_calibration_spread(
+        pred_table=etf_pred_table,
+        model_name=best_model,
+        out_path=os.path.join(report_dir, "fig_etf_pred_bucket_calibration_spread_test.png"),
+        n_buckets=10,
+    )
+    write_bottom_up_report_md(report_dir=report_dir, run_id=run_id, metrics=metrics)
+    write_bottom_up_report_html(report_dir=report_dir, run_id=run_id, metrics=metrics)
 
     # Print final report directory for the caller.
     print(f"[INFO] Done. report_dir={report_dir}")

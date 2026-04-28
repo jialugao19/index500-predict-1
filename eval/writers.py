@@ -517,6 +517,33 @@ def write_bottom_up_report_md(report_dir: str, run_id: str, metrics: dict) -> No
             f"- Selected test metrics: IC=`{float(sel['selected_test_ic']):.6f}`, RankIC=`{float(sel['selected_test_rank_ic']):.6f}`, RMSE=`{float(sel['selected_test_rmse']):.6f}`, MAE=`{float(sel['selected_test_mae']):.6f}`."
         )
         lines.append("")
+    if "basis_model" in metrics:
+        lines.append("## Part 3b: Basis Model (二阶段 residual alpha)")
+        lines.append("")
+        basis_model = metrics["basis_model"]
+        lines.append(f"- Label: `{basis_model['label_definition']}`.")
+        lines.append(f"- Final prediction: `{basis_model['final_prediction_definition']}`.")
+        lines.append(f"- OOF method: `{basis_model['oof_method']}`.")
+        lines.append("")
+        lines.append("### Raw vs Two-stage Delta (test)")
+        lines.append("")
+        lines.append("| raw_model | two_stage_model | ic_delta | rank_ic_delta | rmse_delta | mae_delta | basis_ic | basis_vs_basket_corr |")
+        lines.append("| --- | --- | --- | --- | --- | --- | --- | --- |")
+        for row in basis_model["raw_vs_two_stage_delta_test"]:
+            lines.append(
+                f"| {row['raw_model']} | {row['two_stage_model']} | {float(row['ic_delta']):.6f} | {float(row['rank_ic_delta']):.6f} | {float(row['rmse_delta']):.6f} | {float(row['mae_delta']):.6f} | {float(row['basis_pred_vs_basis_label_ic']):.6f} | {float(row['basis_pred_vs_basket_pred_corr']):.6f} |"
+            )
+        lines.append("")
+        lines.append("### Basis Model Diagnostics")
+        lines.append("")
+        lines.append("| branch | feature_count | train_rows | val_rows | val_month |")
+        lines.append("| --- | --- | --- | --- | --- |")
+        for branch_name in sorted(basis_model["branch_diagnostics"].keys()):
+            row = basis_model["branch_diagnostics"][branch_name]
+            lines.append(
+                f"| {branch_name} | {int(row['feature_count'])} | {int(row['train_rows'])} | {int(row['val_rows'])} | {int(row['val_month'])} |"
+            )
+        lines.append("")
     if "synthetic_vs_real_etf" in metrics:
         lines.append("## Synthetic vs Real ETF (合成收益 vs 真实 ETF 收益)")
         lines.append("")
@@ -561,6 +588,29 @@ def write_bottom_up_report_md(report_dir: str, run_id: str, metrics: dict) -> No
             f"- Selected test metrics: IC=`{float(sel['selected_test_ic']):.6f}`, RankIC=`{float(sel['selected_test_rank_ic']):.6f}`, RMSE=`{float(sel['selected_test_rmse']):.6f}`, MAE=`{float(sel['selected_test_mae']):.6f}`."
         )
         lines.append("")
+        if "nonoverlap_backtest_test" in sel:
+            backtest = sel["nonoverlap_backtest_test"]
+            lines.append("### ETF 30m 非重叠回测摘要 (test)")
+            lines.append("")
+            lines.append("| selected_model | trade_count | horizon_minutes | strategy_total_return_pct | benchmark_total_return_pct | excess_end_bps | strategy_max_drawdown_pct | benchmark_max_drawdown_pct |")
+            lines.append("| --- | --- | --- | --- | --- | --- | --- | --- |")
+            lines.append(
+                f"| {sel['selected_model']} | {int(backtest['trade_count'])} | {int(backtest['horizon_minutes'])} | {float(backtest['strategy_total_return_pct']):.6f} | {float(backtest['benchmark_total_return_pct']):.6f} | {float(backtest['excess_end_bps']):.6f} | {float(backtest['strategy_max_drawdown_pct']):.6f} | {float(backtest['benchmark_max_drawdown_pct']):.6f} |"
+            )
+            lines.append("")
+    if "benchmark_conclusion" in metrics:
+        lines.append("## Benchmark Conclusion")
+        lines.append("")
+        conclusion = metrics["benchmark_conclusion"]
+        lines.append(f"- Clean benchmark candidate: `{bool(conclusion['is_clean_benchmark_candidate'])}`.")
+        lines.append(f"- Reason: {conclusion['reason']}")
+        lines.append("- Required sections:")
+        for section in conclusion["required_sections"]:
+            lines.append(f"  - `{section}`")
+        lines.append("- Known limitations:")
+        for limitation in conclusion["known_limitations"]:
+            lines.append(f"  - {limitation}")
+        lines.append("")
     lines.append("## 图表 (Figures)")
     lines.append("")
     lines.append("![Basket branch comparison (test)](fig_basket_branch_compare_test.png)")
@@ -580,6 +630,12 @@ def write_bottom_up_report_md(report_dir: str, run_id: str, metrics: dict) -> No
     lines.append("![Best model cumulative IC (test)](fig_best_cum_ic.png)")
     lines.append("")
     lines.append("![Best model monthly IC (test)](fig_best_monthly_ic.png)")
+    lines.append("")
+    lines.append("![ETF 30m non-overlap backtest vs long ETF (test)](fig_etf_backtest_compare_test.png)")
+    lines.append("")
+    lines.append("![ETF rolling IC and RankIC (test)](fig_etf_rolling_ic_rankic_test.png)")
+    lines.append("")
+    lines.append("![ETF prediction bucket calibration and spread (test)](fig_etf_pred_bucket_calibration_spread_test.png)")
     lines.append("")
     if "synthetic_vs_real_etf" in metrics:
         lines.append("![Synthetic vs Real scatter (test)](fig_synth_vs_real_scatter_test.png)")
@@ -632,7 +688,9 @@ def write_bottom_up_report_html(report_dir: str, run_id: str, metrics: dict) -> 
         ("Best daily IC (test)", "fig_best_daily_ic.png"),
         ("Best cumulative IC (test)", "fig_best_cum_ic.png"),
         ("Best monthly IC (test)", "fig_best_monthly_ic.png"),
-        ("ETF backtest compare (test)", "fig_etf_backtest_compare_test.png"),
+        ("ETF 30m non-overlap backtest vs long ETF (test)", "fig_etf_backtest_compare_test.png"),
+        ("ETF rolling IC and RankIC (test)", "fig_etf_rolling_ic_rankic_test.png"),
+        ("ETF prediction bucket calibration and spread (test)", "fig_etf_pred_bucket_calibration_spread_test.png"),
         ("Basis best daily IC (test)", "fig_basis_best_daily_ic.png"),
         ("Synthetic vs real daily delta (test)", "fig_synth_vs_real_daily_delta_test.png"),
     ]
@@ -693,6 +751,22 @@ def write_bottom_up_report_html(report_dir: str, run_id: str, metrics: dict) -> 
                 }
             )
 
+    basis_delta_rows = []
+    if "basis_model" in metrics:
+        for row in metrics["basis_model"]["raw_vs_two_stage_delta_test"]:
+            basis_delta_rows.append(
+                {
+                    "raw_model": str(row["raw_model"]),
+                    "two_stage_model": str(row["two_stage_model"]),
+                    "ic_delta": float(row["ic_delta"]),
+                    "rank_ic_delta": float(row["rank_ic_delta"]),
+                    "rmse_delta": float(row["rmse_delta"]),
+                    "mae_delta": float(row["mae_delta"]),
+                    "basis_ic": float(row["basis_pred_vs_basis_label_ic"]),
+                    "basis_vs_basket_corr": float(row["basis_pred_vs_basket_pred_corr"]),
+                }
+            )
+
     etf_rows = []
     for model_name in sorted(metrics["etf_level"]["overall"].keys()):
         row = metrics["etf_level"]["overall"][model_name]["test"]
@@ -705,6 +779,21 @@ def write_bottom_up_report_html(report_dir: str, run_id: str, metrics: dict) -> 
                 "rmse": float(row["rmse"]),
                 "mae": float(row["mae"]),
                 "n": int(row["n"]),
+            }
+        )
+    backtest_rows = []
+    if "selection_etf" in metrics and "nonoverlap_backtest_test" in metrics["selection_etf"]:
+        backtest = metrics["selection_etf"]["nonoverlap_backtest_test"]
+        backtest_rows.append(
+            {
+                "selected_model": str(metrics["selection_etf"]["selected_model"]),
+                "trade_count": int(backtest["trade_count"]),
+                "horizon_minutes": int(backtest["horizon_minutes"]),
+                "strategy_total_return_pct": float(backtest["strategy_total_return_pct"]),
+                "benchmark_total_return_pct": float(backtest["benchmark_total_return_pct"]),
+                "excess_end_bps": float(backtest["excess_end_bps"]),
+                "strategy_max_drawdown_pct": float(backtest["strategy_max_drawdown_pct"]),
+                "benchmark_max_drawdown_pct": float(backtest["benchmark_max_drawdown_pct"]),
             }
         )
 
@@ -753,11 +842,47 @@ def write_bottom_up_report_html(report_dir: str, run_id: str, metrics: dict) -> 
         lines.append("<h2>3. Basis (Basket 预测 vs 真实 ETF, test)</h2>")
         lines.append(_table(basis_rows, ["model", "ic", "rank_ic", "dir_acc", "rmse", "mae", "n"]))
 
+    if len(basis_delta_rows) > 0:
+        lines.append("<h2>3b. Basis Model (二阶段 residual alpha, test)</h2>")
+        lines.append(
+            _table(
+                basis_delta_rows,
+                ["raw_model", "two_stage_model", "ic_delta", "rank_ic_delta", "rmse_delta", "mae_delta", "basis_ic", "basis_vs_basket_corr"],
+            )
+        )
+
     lines.append("<h2>4. ETF Level (test)</h2>")
     lines.append(_table(etf_rows, ["model", "ic", "rank_ic", "dir_acc", "rmse", "mae", "n"]))
 
+    if len(backtest_rows) > 0:
+        lines.append("<h2>5. ETF 30m Non-overlap Backtest Summary (test)</h2>")
+        lines.append(
+            _table(
+                backtest_rows,
+                [
+                    "selected_model",
+                    "trade_count",
+                    "horizon_minutes",
+                    "strategy_total_return_pct",
+                    "benchmark_total_return_pct",
+                    "excess_end_bps",
+                    "strategy_max_drawdown_pct",
+                    "benchmark_max_drawdown_pct",
+                ],
+            )
+        )
+
+    if "benchmark_conclusion" in metrics:
+        conclusion = metrics["benchmark_conclusion"]
+        lines.append("<h2>6. Benchmark Conclusion</h2>")
+        lines.append("<div class='card'>")
+        lines.append(f"<div class='small'>Clean benchmark candidate: <code>{bool(conclusion['is_clean_benchmark_candidate'])}</code></div>")
+        lines.append(f"<p>{conclusion['reason']}</p>")
+        lines.append("<p class='small'>Known limitations: " + "; ".join([str(x) for x in conclusion["known_limitations"]]) + ".</p>")
+        lines.append("</div>")
+
     if len(embedded_imgs) > 0:
-        lines.append("<h2>5. Figures</h2>")
+        lines.append("<h2>7. Figures</h2>")
         lines.append("<div class='grid'>")
         for item in embedded_imgs:
             lines.append("<div class='card'>")

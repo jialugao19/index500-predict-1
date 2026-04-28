@@ -91,32 +91,259 @@ def plot_prediction_timeseries(pred_table: pd.DataFrame, model_name: str, out_pa
     plt.close()
 
 
-def plot_etf_backtest_compare(pred_table: pd.DataFrame, model_name: str, out_path: str) -> None:
-    """Plot a simple ETF backtest comparison curve on the test split."""
+def _build_nonoverlap_trade_table(part: pd.DataFrame, horizon_minutes: int) -> pd.DataFrame:
+    """Build a non-overlap trade table from overlapping ETF predictions."""
 
-    # Filter to the selected model and test split, then sort by timestamp.
+    # Assign a stable within-day row index.
+    trades = part.loc[:, ["date", "datetime", "pred", "label"]].copy()
+    trades["row_in_day"] = trades.groupby("date", sort=True).cumcount()
+
+    # Keep only non-overlap entry rows.
+    trades = trades.loc[(trades["row_in_day"].astype(int) % int(horizon_minutes)) == 0].copy()
+
+    # Compute trade-level returns from non-overlap holding windows.
+    trades["position"] = np.sign(trades["pred"].astype(float))
+    trades["strategy_ret"] = trades["position"].astype(float) * trades["label"].astype(float)
+    return trades
+
+
+def _attach_trade_exit_datetime(trades: pd.DataFrame, etf_price_table: pd.DataFrame, horizon_minutes: int) -> pd.DataFrame:
+    """Attach exit timestamps to each non-overlap trade."""
+
+    # Resolve each trade exit against the full ETF minute timeline.
+    pieces: list[pd.DataFrame] = []
+    for date, day_trades in trades.groupby("date", sort=True):
+        # Load the full ETF minute timeline for the day.
+        day_prices = etf_price_table.loc[etf_price_table["date"].astype(int) == int(date), ["datetime"]].copy()
+        day_prices = day_prices.sort_values("datetime", ascending=True).reset_index(drop=True)
+
+        # Map each entry row index to its exit timestamp.
+        day_part = day_trades.copy()
+        exit_idx = day_part["row_in_day"].astype(int).to_numpy() + int(horizon_minutes)
+        day_part["exit_datetime"] = day_prices.iloc[exit_idx]["datetime"].to_numpy()
+        pieces.append(day_part)
+    out = pd.concat(pieces, axis=0, ignore_index=True)
+    return out
+
+
+def _expand_trade_curve_to_minute_grid(
+    etf_price_table: pd.DataFrame,
+    trades: pd.DataFrame,
+    ret_col: str,
+) -> pd.DataFrame:
+    """Expand trade-level returns into a minute-level step curve."""
+
+    # Build a minute grid from the ETF price table.
+    minute_grid = etf_price_table.loc[:, ["datetime", "close"]].copy()
+    minute_grid = minute_grid.sort_values("datetime", ascending=True).reset_index(drop=True)
+
+    # Convert sequential trade returns into exit-time equity updates.
+    equity = 1.0
+    updates: list[dict] = []
+    for row in trades.sort_values("exit_datetime", ascending=True).itertuples(index=False):
+        # Compound the next trade return.
+        equity = equity * (1.0 + float(getattr(row, ret_col)))
+        updates.append({"datetime": pd.to_datetime(row.exit_datetime), "equity": float(equity)})
+
+    # Forward-fill equity between trade exits.
+    updates_df = pd.DataFrame(updates)
+    if len(updates_df) == 0:
+        minute_grid["equity"] = 1.0
+        return minute_grid
+    minute_grid = minute_grid.merge(updates_df, on="datetime", how="left")
+    minute_grid["equity"] = minute_grid["equity"].ffill().fillna(1.0)
+    return minute_grid
+
+
+def compute_nonoverlap_backtest_summary(
+    pred_table: pd.DataFrame,
+    model_name: str,
+    etf_price_table: pd.DataFrame,
+    horizon_minutes: int,
+) -> dict:
+    """Compute summary stats for the ETF non-overlap backtest."""
+
+    # Filter the selected model and align the ETF price panel.
     part = pred_table.loc[(pred_table["model_name"] == model_name) & (pred_table["split"] == "test")].copy()
-    part = part.sort_values("datetime", ascending=True)
+    part = part.sort_values(["date", "datetime"], ascending=True).reset_index(drop=True)
+    bench = etf_price_table.loc[:, ["date", "datetime", "close"]].copy()
+    bench = bench.sort_values(["date", "datetime"], ascending=True).reset_index(drop=True)
 
-    # Build the minute-level realized returns and a sign(pred) long-short strategy return.
-    pred = part["pred"].to_numpy(dtype=float)
-    label = part["label"].to_numpy(dtype=float)
-    pos = np.sign(pred)
-    strat_ret = pos * label
+    # Build the trade table and the realized strategy curve.
+    trades = _build_nonoverlap_trade_table(part=part, horizon_minutes=horizon_minutes)
+    trades = _attach_trade_exit_datetime(trades=trades, etf_price_table=bench, horizon_minutes=horizon_minutes)
+    bench["benchmark_curve"] = bench["close"].astype(float) / float(bench["close"].astype(float).iloc[0])
+    strategy = _expand_trade_curve_to_minute_grid(
+        etf_price_table=bench.loc[:, ["datetime", "benchmark_curve"]].rename(columns={"benchmark_curve": "close"}),
+        trades=trades,
+        ret_col="strategy_ret",
+    )
 
-    # Convert into cumulative curves starting from 1.0.
-    bench_curve = np.cumprod(1.0 + label)
-    strat_curve = np.cumprod(1.0 + strat_ret)
+    # Summarize end value, excess return, and max drawdown.
+    strategy_curve = strategy["equity"].astype(float).to_numpy()
+    benchmark_curve = bench["benchmark_curve"].astype(float).to_numpy()
+    excess_curve_bps = (strategy_curve / benchmark_curve - 1.0) * 1e4
+    strategy_drawdown_pct = (strategy_curve / np.maximum.accumulate(strategy_curve) - 1.0) * 100.0
+    benchmark_drawdown_pct = (benchmark_curve / np.maximum.accumulate(benchmark_curve) - 1.0) * 100.0
+    return {
+        "trade_count": int(len(trades)),
+        "horizon_minutes": int(horizon_minutes),
+        "strategy_end": float(strategy_curve[-1]),
+        "strategy_total_return_pct": float((strategy_curve[-1] - 1.0) * 100.0),
+        "benchmark_end": float(benchmark_curve[-1]),
+        "benchmark_total_return_pct": float((benchmark_curve[-1] - 1.0) * 100.0),
+        "excess_end_bps": float(excess_curve_bps[-1]),
+        "strategy_max_drawdown_pct": float(np.min(strategy_drawdown_pct)),
+        "benchmark_max_drawdown_pct": float(np.min(benchmark_drawdown_pct)),
+    }
 
-    # Plot the cumulative curves for quick backtest diagnostics.
-    plt.figure(figsize=(12, 4))
-    plt.plot(part["datetime"], bench_curve, label="Benchmark: long ETF (cum)", linewidth=1.1)
-    plt.plot(part["datetime"], strat_curve, label="Strategy: sign(pred)*label (cum)", linewidth=1.1)
-    plt.title(f"ETF Backtest Compare ({model_name}, test)")
-    plt.legend()
+
+def plot_etf_backtest_compare(
+    pred_table: pd.DataFrame,
+    model_name: str,
+    out_path: str,
+    etf_price_table: pd.DataFrame,
+    horizon_minutes: int,
+) -> None:
+    """Plot a 30m non-overlap ETF strategy against a true long ETF benchmark."""
+
+    # Filter to the selected model and test split.
+    part = pred_table.loc[(pred_table["model_name"] == model_name) & (pred_table["split"] == "test")].copy()
+    part = part.sort_values(["date", "datetime"], ascending=True).reset_index(drop=True)
+    etf_price_table = etf_price_table.loc[:, ["date", "datetime", "close"]].copy()
+    etf_price_table = etf_price_table.sort_values(["date", "datetime"], ascending=True).reset_index(drop=True)
+
+    # Build the non-overlap trade table.
+    trades = _build_nonoverlap_trade_table(part=part, horizon_minutes=horizon_minutes)
+    trades = _attach_trade_exit_datetime(trades=trades, etf_price_table=etf_price_table, horizon_minutes=horizon_minutes)
+
+    # Build the minute-level benchmark and strategy curves.
+    bench = etf_price_table.loc[:, ["date", "datetime", "close"]].copy()
+    bench["benchmark_curve"] = bench["close"].astype(float) / float(bench["close"].astype(float).iloc[0])
+    strategy = _expand_trade_curve_to_minute_grid(
+        etf_price_table=bench.loc[:, ["datetime", "benchmark_curve"]].rename(columns={"benchmark_curve": "close"}),
+        trades=trades,
+        ret_col="strategy_ret",
+    )
+    strategy_curve = strategy["equity"].astype(float).to_numpy()
+    benchmark_curve = bench["benchmark_curve"].astype(float).to_numpy()
+    excess_curve_bps = (strategy_curve / benchmark_curve - 1.0) * 1e4
+    strategy_drawdown_pct = (strategy_curve / np.maximum.accumulate(strategy_curve) - 1.0) * 100.0
+    benchmark_drawdown_pct = (benchmark_curve / np.maximum.accumulate(benchmark_curve) - 1.0) * 100.0
+
+    # Draw the cumulative curve panel.
+    fig, (ax1, ax2, ax3) = plt.subplots(
+        3,
+        1,
+        figsize=(12, 8),
+        sharex=True,
+        gridspec_kw={"height_ratios": [1.8, 1.4, 1.2]},
+    )
+    ax1.plot(bench["datetime"], strategy_curve, label="Strategy: 30m non-overlap, sign(pred)", linewidth=1.2)
+    ax1.plot(bench["datetime"], benchmark_curve, label="Benchmark: long ETF", linewidth=1.2)
+    ax1.set_ylabel("Curve")
+    ax1.set_title(f"ETF 30m Non-overlap Backtest vs Long ETF ({model_name}, test)")
+    ax1.legend()
+
+    # Draw the excess-return panel.
+    ax2.plot(bench["datetime"], excess_curve_bps, label="Strategy excess vs long ETF", linewidth=1.1)
+    ax2.axhline(0.0, color="black", linewidth=0.8, alpha=0.7)
+    ax2.set_ylabel("Excess (bps)")
+    ax2.legend()
+
+    # Draw the drawdown panel.
+    ax3.plot(bench["datetime"], strategy_drawdown_pct, label="Strategy drawdown", linewidth=1.0)
+    ax3.plot(bench["datetime"], benchmark_drawdown_pct, label="Benchmark drawdown", linewidth=1.0, alpha=0.85)
+    ax3.axhline(0.0, color="black", linewidth=0.8, alpha=0.7)
+    ax3.set_ylabel("Drawdown (%)")
+    ax3.legend()
+
+    # Save the combined figure.
     plt.tight_layout()
     plt.savefig(out_path)
-    plt.close()
+    plt.close(fig)
+
+
+def plot_rolling_ic_rankic(daily: pd.DataFrame, title: str, out_path: str) -> None:
+    """Plot ETF rolling IC and RankIC curves."""
+
+    # Build the datetime x-axis from the daily table.
+    dates = pd.to_datetime(daily["date"].astype(str), format="%Y%m%d")
+
+    # Draw the IC panel.
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 6), sharex=True)
+    ax1.plot(dates, daily["ic"], label="daily_ic", linewidth=0.8, alpha=0.55)
+    if "ic_roll_20" in daily.columns:
+        ax1.plot(dates, daily["ic_roll_20"], label="ic_roll_20", linewidth=1.2)
+    if "ic_roll_60" in daily.columns:
+        ax1.plot(dates, daily["ic_roll_60"], label="ic_roll_60", linewidth=1.2)
+    ax1.axhline(0.0, color="black", linewidth=0.8, alpha=0.7)
+    ax1.set_ylabel("IC")
+    ax1.set_title(title)
+    ax1.legend()
+
+    # Draw the RankIC panel.
+    ax2.plot(dates, daily["rank_ic"], label="daily_rank_ic", linewidth=0.8, alpha=0.55)
+    if "rank_ic_roll_20" in daily.columns:
+        ax2.plot(dates, daily["rank_ic_roll_20"], label="rank_ic_roll_20", linewidth=1.2)
+    if "rank_ic_roll_60" in daily.columns:
+        ax2.plot(dates, daily["rank_ic_roll_60"], label="rank_ic_roll_60", linewidth=1.2)
+    ax2.axhline(0.0, color="black", linewidth=0.8, alpha=0.7)
+    ax2.set_ylabel("RankIC")
+    ax2.legend()
+
+    # Save the combined figure.
+    plt.tight_layout()
+    plt.savefig(out_path)
+    plt.close(fig)
+
+
+def plot_prediction_bucket_calibration_spread(
+    pred_table: pd.DataFrame,
+    model_name: str,
+    out_path: str,
+    n_buckets: int,
+) -> None:
+    """Plot ETF prediction bucket calibration and spread on the test split."""
+
+    # Filter to the selected model and test split.
+    part = pred_table.loc[(pred_table["model_name"] == model_name) & (pred_table["split"] == "test"), ["pred", "label"]].copy()
+
+    # Build prediction quantile buckets with stable tie handling.
+    rank = part["pred"].rank(method="first")
+    part["bucket"] = pd.qcut(rank, q=int(n_buckets), labels=False).astype(int) + 1
+
+    # Summarize bucket-level calibration statistics.
+    bucket_table = (
+        part.groupby("bucket", sort=True)
+        .agg(pred_mean=("pred", "mean"), label_mean=("label", "mean"), n=("pred", "size"))
+        .reset_index()
+    )
+    bucket_table["pred_mean_bps"] = bucket_table["pred_mean"].astype(float) * 1e4
+    bucket_table["label_mean_bps"] = bucket_table["label_mean"].astype(float) * 1e4
+    top_bottom_spread_bps = float(bucket_table["label_mean_bps"].iloc[-1] - bucket_table["label_mean_bps"].iloc[0])
+
+    # Draw the calibration panel.
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4.8))
+    ax1.plot(bucket_table["bucket"], bucket_table["pred_mean_bps"], marker="o", linewidth=1.2, label="pred_mean")
+    ax1.plot(bucket_table["bucket"], bucket_table["label_mean_bps"], marker="o", linewidth=1.2, label="label_mean")
+    ax1.axhline(0.0, color="black", linewidth=0.8, alpha=0.7)
+    ax1.set_xlabel("Prediction bucket")
+    ax1.set_ylabel("Return (bps)")
+    ax1.set_title("Prediction bucket calibration")
+    ax1.legend()
+
+    # Draw the realized spread panel.
+    ax2.bar(bucket_table["bucket"].astype(str), bucket_table["label_mean_bps"])
+    ax2.axhline(0.0, color="black", linewidth=0.8, alpha=0.7)
+    ax2.set_xlabel("Prediction bucket")
+    ax2.set_ylabel("Realized return (bps)")
+    ax2.set_title(f"Realized spread, top-bottom={top_bottom_spread_bps:.2f} bps")
+
+    # Save the combined figure.
+    plt.tight_layout()
+    plt.savefig(out_path)
+    plt.close(fig)
 
 
 def plot_feature_importance(importances: list[dict], out_path: str, top_k: int, title: str) -> None:
