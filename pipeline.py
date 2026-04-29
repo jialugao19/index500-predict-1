@@ -291,6 +291,102 @@ def collect_stock_training_sample(
     return sample
 
 
+def init_metric_sums() -> dict:
+    """Create additive metric sums for one prediction stream."""
+
+    # Initialize additive counters used by pooled test metrics.
+    return {
+        "n": 0,
+        "pred_sum": 0.0,
+        "label_sum": 0.0,
+        "pred2_sum": 0.0,
+        "label2_sum": 0.0,
+        "pred_label_sum": 0.0,
+        "abs_err_sum": 0.0,
+        "sq_err_sum": 0.0,
+        "dir_correct_sum": 0.0,
+    }
+
+
+def update_metric_sums(stats: dict, pred: np.ndarray, label: np.ndarray) -> None:
+    """Accumulate pooled metric sums from one prediction block."""
+
+    # Filter to finite prediction-label pairs.
+    pred_arr = np.asarray(pred, dtype=float)
+    label_arr = np.asarray(label, dtype=float)
+    mask = np.isfinite(pred_arr) & np.isfinite(label_arr)
+    pred_clean = pred_arr[mask]
+    label_clean = label_arr[mask]
+    err = pred_clean - label_clean
+
+    # Add block-level sums into the running counters.
+    stats["n"] += int(len(pred_clean))
+    stats["pred_sum"] += float(np.sum(pred_clean))
+    stats["label_sum"] += float(np.sum(label_clean))
+    stats["pred2_sum"] += float(np.sum(pred_clean * pred_clean))
+    stats["label2_sum"] += float(np.sum(label_clean * label_clean))
+    stats["pred_label_sum"] += float(np.sum(pred_clean * label_clean))
+    stats["abs_err_sum"] += float(np.sum(np.abs(err)))
+    stats["sq_err_sum"] += float(np.sum(err * err))
+    stats["dir_correct_sum"] += float(np.sum((pred_clean > 0.0) == (label_clean > 0.0)))
+
+
+def finalize_metric_sums(stats: dict, rank_ic: float) -> dict:
+    """Finalize pooled metrics from additive sums."""
+
+    # Compute Pearson IC from second moments.
+    n = int(stats["n"])
+    pred_mean = float(stats["pred_sum"]) / float(n)
+    label_mean = float(stats["label_sum"]) / float(n)
+    pred_var = float(stats["pred2_sum"]) / float(n) - pred_mean * pred_mean
+    label_var = float(stats["label2_sum"]) / float(n) - label_mean * label_mean
+    cov = float(stats["pred_label_sum"]) / float(n) - pred_mean * label_mean
+    denom = float(np.sqrt(pred_var * label_var))
+    ic = cov / denom
+
+    # Return metrics using the same field names as compute_metrics.
+    return {
+        "ic": float(ic),
+        "rank_ic": float(rank_ic),
+        "direction_acc": float(stats["dir_correct_sum"]) / float(n),
+        "rmse": float(np.sqrt(float(stats["sq_err_sum"]) / float(n))),
+        "mae": float(stats["abs_err_sum"]) / float(n),
+        "n": int(n),
+    }
+
+
+def compute_daily_metric_row(date: int, pred: np.ndarray, label: np.ndarray) -> dict:
+    """Compute one daily prediction metric row."""
+
+    # Filter to finite prediction-label pairs.
+    pred_arr = np.asarray(pred, dtype=float)
+    label_arr = np.asarray(label, dtype=float)
+    mask = np.isfinite(pred_arr) & np.isfinite(label_arr)
+    pred_clean = pred_arr[mask]
+    label_clean = label_arr[mask]
+    err = pred_clean - label_clean
+
+    # Return daily metrics using the same field names as compute_metrics.
+    return {
+        "date": int(date),
+        "ic": safe_corr(pred_clean, label_clean),
+        "rank_ic": safe_spearman(pred_clean, label_clean),
+        "direction_acc": float(np.mean((pred_clean > 0.0) == (label_clean > 0.0))) if len(pred_clean) else float("nan"),
+        "rmse": float(np.sqrt(np.mean(err * err))) if len(err) else float("nan"),
+        "mae": float(np.mean(np.abs(err))) if len(err) else float("nan"),
+        "n": int(len(pred_clean)),
+    }
+
+
+def compute_rank_ic_from_chunks(chunks: list[tuple[np.ndarray, np.ndarray]]) -> float:
+    """Compute exact pooled RankIC from chunked prediction-label arrays."""
+
+    # Concatenate only the test arrays needed for exact pooled Spearman.
+    pred = np.concatenate([pair[0] for pair in chunks]).astype(float)
+    label = np.concatenate([pair[1] for pair in chunks]).astype(float)
+    return safe_spearman(pred, label)
+
+
 def fit_stock_model_bundle(
     train_dates: list[int],
     weights: pd.DataFrame,
@@ -649,12 +745,15 @@ def run_bottom_up_synthesis(
 
     # Stage 2: Generate stock metrics (test) and basket predictions (train+test).
     minute_ic_tables: dict[str, list[pd.DataFrame]] = {k: [] for k in ["xgb", "lgbm"]}
+    stock_metric_sums: dict[str, dict] = {k: init_metric_sums() for k in ["xgb", "lgbm"]}
+    stock_daily_metric_rows: dict[str, list[dict]] = {k: [] for k in ["xgb", "lgbm"]}
+    stock_rank_chunks: dict[str, list[tuple[np.ndarray, np.ndarray]]] = {k: [] for k in ["xgb", "lgbm"]}
     stock_ts_stats_tables: list[pd.DataFrame] = []
     stock_daily_ic_tables: list[pd.DataFrame] = []
-    stock_ts_pred_tables: list[pd.DataFrame] = []
     basket_rows: list[pd.DataFrame] = []
     component_rows: list[pd.DataFrame] = []
-    for date in dates_needed:
+    stock_loop_started = time.time()
+    for date_idx, date in enumerate(dates_needed, start=1):
         # Load cached day panel and keep train/test rows only.
         day = load_or_build_stock_panel_day(
             date=int(date),
@@ -677,34 +776,15 @@ def run_bottom_up_synthesis(
         # Collect constituent state features for the second-stage basis model.
         component_rows.append(build_component_basis_features_day(stock_day=day))
 
-        # Collect stock-level pooled time-series prediction rows for TS-IC evaluation.
-        stock_ts_pred_tables.append(
-            pd.DataFrame(
-                {
-                    'datetime': pd.to_datetime(day['datetime']).astype('datetime64[ns]'),
-                    'date': day['date'].astype(int),
-                    'pred': xgb_pred.astype(float),
-                    'label': day['label_stock_10m'].astype(float),
-                    'split': day['split'].astype(str),
-                    'model_name': 'xgb',
-                }
-            )
-        )
-        stock_ts_pred_tables.append(
-            pd.DataFrame(
-                {
-                    'datetime': pd.to_datetime(day['datetime']).astype('datetime64[ns]'),
-                    'date': day['date'].astype(int),
-                    'pred': lgbm_pred.astype(float),
-                    'label': day['label_stock_10m'].astype(float),
-                    'split': day['split'].astype(str),
-                    'model_name': 'lgbm',
-                }
-            )
-        )
-
         # Compute stock-level panel IC tables for the test split only.
         if str(day["split"].iloc[0]) == "test":
+            label_arr = day["label_stock_10m"].to_numpy(dtype=float)
+            update_metric_sums(stats=stock_metric_sums["xgb"], pred=xgb_pred, label=label_arr)
+            update_metric_sums(stats=stock_metric_sums["lgbm"], pred=lgbm_pred, label=label_arr)
+            stock_daily_metric_rows["xgb"].append(compute_daily_metric_row(date=int(date), pred=xgb_pred, label=label_arr))
+            stock_daily_metric_rows["lgbm"].append(compute_daily_metric_row(date=int(date), pred=lgbm_pred, label=label_arr))
+            stock_rank_chunks["xgb"].append((xgb_pred.astype(float), label_arr.astype(float)))
+            stock_rank_chunks["lgbm"].append((lgbm_pred.astype(float), label_arr.astype(float)))
             minute_ic_tables["xgb"].append(compute_panel_ic_by_minute(day_panel=day, pred=xgb_pred, label_col="label_stock_10m"))
             minute_ic_tables["lgbm"].append(compute_panel_ic_by_minute(day_panel=day, pred=lgbm_pred, label_col="label_stock_10m"))
             stock_ts_stats_tables.append(compute_stock_sufficient_stats(day_panel=day, pred=xgb_pred, label_col="label_stock_10m"))
@@ -747,15 +827,22 @@ def run_bottom_up_synthesis(
             basket_lgbm_var["model_name"] = f"basket_{tag}_stock_lgbm"
             basket_rows.append(pd.concat([basket_xgb_var, basket_lgbm_var], axis=0, ignore_index=True))
 
+        # Print progress for the expensive full-panel stock loop.
+        if date_idx % 25 == 0 or date_idx == len(dates_needed):
+            elapsed = time.time() - stock_loop_started
+            print(
+                f"[INFO] stock_predict progress day={date_idx}/{len(dates_needed)} date={int(date)} "
+                f"elapsed={elapsed:.1f}s."
+            )
+
     # Stage 3: Evaluate Stock Alpha and write basket_pred.parquet (deliverable).
-    # Stage 3: Compute pooled stock TS-IC using the same compute_metrics convention as ETF.
-    stock_ts_pred_table = pd.concat(stock_ts_pred_tables, axis=0, ignore_index=True)
-    stock_ts_metrics = compute_metrics(pred_table=stock_ts_pred_table)
+    # Stage 3: Compute pooled stock TS metrics without materializing a full prediction DataFrame.
     stock_alpha_overall: dict[str, dict] = {}
     for model_name in ["xgb", "lgbm"]:
         # Summarize pooled TS-IC and daily TS-IC statistics for each stock model.
-        ts_test = stock_ts_metrics["overall"][str(model_name)]["test"]
-        ts_daily = pd.DataFrame(stock_ts_metrics["daily"][str(model_name)]).copy()
+        rank_ic = compute_rank_ic_from_chunks(chunks=stock_rank_chunks[str(model_name)])
+        ts_test = finalize_metric_sums(stats=stock_metric_sums[str(model_name)], rank_ic=rank_ic)
+        ts_daily = pd.DataFrame(stock_daily_metric_rows[str(model_name)]).copy()
         ts_daily_ic_mean = float(ts_daily["ic"].mean())
         ts_daily_rank_ic_mean = float(ts_daily["rank_ic"].mean())
         ts_daily_ic_std = float(ts_daily["ic"].std())
@@ -821,60 +908,6 @@ def run_bottom_up_synthesis(
 
     # Merge minute-level and within-day summary tables to one per-stock evaluation table.
     stock_metrics = stock_per_stock_ts_metrics.merge(stock_daily_summary, on="stock_code", how="left")
-
-    # Tag stocks as good/bad/neutral using an IC t-stat threshold.
-    ic_t_threshold = 2.0
-    ic_abs_threshold = 0.05
-    stock_metrics["verdict"] = "neutral"
-    stock_metrics.loc[(stock_metrics["ic"] >= ic_abs_threshold) & (stock_metrics["ic_t"] >= ic_t_threshold), "verdict"] = "good"
-    stock_metrics.loc[(stock_metrics["ic"] <= -ic_abs_threshold) & (stock_metrics["ic_t"] <= -ic_t_threshold), "verdict"] = "bad"
-
-    # Write the per-stock table as a parquet artifact for detailed inspection.
-    stock_metrics_path = os.path.join(report_dir, "stock_metrics_test.parquet")
-    stock_metrics.to_parquet(stock_metrics_path, index=False)
-
-    # Add a compact per-stock summary into metrics.yaml for the markdown report.
-    ic_vals = stock_metrics["ic"].to_numpy(dtype=float)
-    ic_vals = ic_vals[np.isfinite(ic_vals)]
-    q05, q50, q95 = np.quantile(ic_vals, [0.05, 0.50, 0.95]) if len(ic_vals) else [float("nan")] * 3
-    verdict_counts = stock_metrics["verdict"].value_counts(dropna=False).to_dict()
-    stock_alpha_metrics["per_stock_test"] = {
-        "ic_t_threshold": float(ic_t_threshold),
-        "ic_abs_threshold": float(ic_abs_threshold),
-        "n_stocks": int(len(stock_metrics)),
-        "verdict_counts": {str(k): int(v) for k, v in verdict_counts.items()},
-        "ic_quantiles": {"q05": float(q05), "q50": float(q50), "q95": float(q95)},
-        "top_ic": stock_metrics.sort_values("ic", ascending=False)
-        .head(10)
-        .loc[:, ["stock_code", "weight_mean", "ic", "ic_t", "direction_acc", "rmse", "mae"]]
-        .to_dict(orient="records"),
-        "bottom_ic": stock_metrics.sort_values("ic", ascending=True)
-        .head(10)
-        .loc[:, ["stock_code", "weight_mean", "ic", "ic_t", "direction_acc", "rmse", "mae"]]
-        .to_dict(orient="records"),
-        "artifact_stock_metrics_test": "stock_metrics_test.parquet",
-    }
-    # Compute per-stock time-series metrics on the test split for stock-level diagnostics.
-    stock_ts_stats = pd.concat(stock_ts_stats_tables, axis=0, ignore_index=True)
-    stock_ts_stats_sum = stock_ts_stats.groupby("stock_code", sort=True).sum(numeric_only=True).reset_index()
-    stock_ts_metrics = finalize_stock_metrics_from_sufficient_stats(stats=stock_ts_stats_sum)
-
-    # Compute per-stock within-day IC averages as a robustness cross-check.
-    stock_daily_ic = pd.concat(stock_daily_ic_tables, axis=0, ignore_index=True)
-    stock_daily_summary = (
-        stock_daily_ic.groupby("stock_code", sort=True)
-        .agg(
-            daily_ic_mean=("daily_ic", "mean"),
-            daily_rank_ic_mean=("daily_rank_ic", "mean"),
-            days=("daily_ic", "size"),
-            daily_n_sum=("n", "sum"),
-            daily_ic_neg_rate=("daily_ic", lambda s: float(np.mean(s.to_numpy(dtype=float) < 0.0))),
-        )
-        .reset_index()
-    )
-
-    # Merge minute-level and within-day summary tables to one per-stock evaluation table.
-    stock_metrics = stock_ts_metrics.merge(stock_daily_summary, on="stock_code", how="left")
 
     # Tag stocks as good/bad/neutral using an IC t-stat threshold.
     ic_t_threshold = 2.0
